@@ -314,7 +314,14 @@ Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 
 - End to end on the real p1 file (1.6 GB, 13 fields × 5 steps): 11 s wall on 16 threads, every field within
   its pointwise bound on every step; the 13 fields shrink to about 5 MB, the output (554 MB) is now
   dominated by the uncompressed mesh that the HODG file rewrites every step.
-- Not done: GPU backends (M2), CUDA/cross-backend matrix (M5), MPI in the drivers, simplex verification.
+- M2 started (2026-11-19 10:00): `Backend` interface for the numeric stages with the CPU implementation and a
+  first HIP backend (dense per-cell operators, elementwise kernels, per-call staging); `runconf_hip` and the
+  `HPMGARD_ENABLE_HIP` option; the HIP library and plugin compile and install (`install-hip`); validated on
+  login03's MI210: `HPMGARD_TEST_DEVICE=hip ./test_compressor` passes 50/50 checks compressing on the GPU and
+  decoding on the CPU with byte-identical stream sizes. Resume at:
+  device-resident data across stages, tensor-sweep kernels, GPU FRBP/Huffman with the byte-identity test,
+  MGARD-X HIP device type, CUDA via the compat shim.
+- Not done: CUDA/cross-backend matrix (M5), MPI in the drivers, simplex verification, parallel Huffman/zstd.
 
 ## 9. Milestones and functionality checklist
 
