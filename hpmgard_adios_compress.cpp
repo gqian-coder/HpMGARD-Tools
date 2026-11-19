@@ -11,6 +11,8 @@
 #include "adios_copy.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <type_traits>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -28,13 +30,27 @@ static std::vector<std::string> Split(const std::string& s, char sep) {
     return out;
 }
 
+template <class T>
+static void AccumulateStats(adios2::Variable<T> v, adios2::Engine& reader, size_t step, int ncomp,
+                            std::vector<double>& ss, std::vector<double>& lo, std::vector<double>& hi, std::vector<size_t>& n) {
+    const auto blocks = reader.BlocksInfo(v, step);
+    std::vector<T> buf;
+    for (size_t b = 0; b < blocks.size(); ++b) {
+        size_t cnt = 1; for (auto c : blocks[b].Count) cnt *= c;
+        buf.resize(cnt); v.SetStepSelection({step, 1});
+        if (v.Shape().empty()) v.SetBlockSelection(b); else v.SetSelection({blocks[b].Start, blocks[b].Count});
+        reader.Get(v, buf.data(), adios2::Mode::Sync);
+        for (size_t i = 0; i < cnt; ++i) { const int c = static_cast<int>(i % ncomp); const double x = buf[i]; ss[c] += x * x; ++n[c]; lo[c] = std::min(lo[c], x); hi[c] = std::max(hi[c], x); }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { std::cerr << "usage: hpmgard_adios_compress in.bp out.bp --tol T [options]\n"; return 2; }
     const std::string in_file = argv[1], out_file = argv[2];
     std::map<std::string, std::string> a;
     for (int i = 3; i < argc; ++i) {
         std::string k = argv[i]; if (k.rfind("--", 0) != 0) { std::cerr << "unexpected " << k << "\n"; return 2; } k = k.substr(2);
-        if (k == "no-mesh" || k == "verbose") a[k] = "1"; else { if (i + 1 >= argc) { std::cerr << "missing value for --" << k << "\n"; return 2; } a[k] = argv[++i]; }
+        if (k == "no-mesh" || k == "verbose" || k == "block-norm") a[k] = "1"; else { if (i + 1 >= argc) { std::cerr << "missing value for --" << k << "\n"; return 2; } a[k] = argv[++i]; }
     }
     auto get = [&](const std::string& k, const std::string& d) { auto it = a.find(k); return it == a.end() ? d : it->second; };
     if (!a.count("tol")) { std::cerr << "--tol is required\n"; return 2; }
@@ -79,6 +95,26 @@ int main(int argc, char** argv) {
     if (a.count("verbose")) common["verbose"] = "1";
     const bool use_mesh = !a.count("no-mesh");
 
+    const bool block_norm = a.count("block-norm") > 0;   // legacy: let every block normalise its own tolerance
+    const std::string mode = get("mode", "REL_L2");
+    const double eb = std::stod(a["tol"]);
+    // Variable-wide scale per component over all blocks of a step (RMS for REL_L2, range for REL_RANGE),
+    // so that one absolute bound applies to every block of the variable.
+    auto variable_tolerances = [&](const Target& t, size_t step) -> std::string {
+        if (block_norm || mode == "ABS") return a["tol"];
+        const std::string type = in.VariableType(t.var);
+        const int ncomp = std::max(1, attr_int(t.name + "/components"));
+        std::vector<double> ss(ncomp, 0.0), lo(ncomp, 1e300), hi(ncomp, -1e300); std::vector<size_t> n(ncomp, 0);
+        if (type == "double") AccumulateStats<double>(in.InquireVariable<double>(t.var), reader, step, ncomp, ss, lo, hi, n);
+        else AccumulateStats<float>(in.InquireVariable<float>(t.var), reader, step, ncomp, ss, lo, hi, n);
+        std::string list;
+        for (int c = 0; c < ncomp; ++c) {
+            const double scale = (mode == "REL_RANGE") ? (hi[c] - lo[c]) : (n[c] ? std::sqrt(ss[c] / n[c]) : 0.0);
+            char b[64]; std::snprintf(b, sizeof b, "%.17g", eb * scale); list += (c ? "," : "") + std::string(b);
+        }
+        return list;
+    };
+
     const size_t nsteps = std::min(max_steps, reader.Steps());
     for (size_t step = 0; step < nsteps; ++step) {
         const auto t0 = Clock::now();
@@ -89,6 +125,7 @@ int main(int argc, char** argv) {
             const Target& t = *std::find_if(targets.begin(), targets.end(), [&](const Target& x) { return x.var == var; });
             adios2::Params p = common;
             p["cell_type"] = t.cell_type; p["order"] = std::to_string(t.order);
+            p["tolerance"] = variable_tolerances(t, step); if (!block_norm && mode != "ABS") p["mode"] = "ABS";
             if (use_mesh && !t.conn.empty() && !t.coords.empty()) { p["meshfile"] = in_file; p["connectivity_variable"] = t.conn; p["coordinates_variable"] = t.coords; }
             auto decorate_d = [&](adios2::Variable<double>& v, size_t block) { v.RemoveOperations(); adios2::Params q = p; q["blockid"] = std::to_string(block); v.AddOperation("plugin", q); };
             auto decorate_f = [&](adios2::Variable<float>& v, size_t block) { v.RemoveOperations(); adios2::Params q = p; q["blockid"] = std::to_string(block); v.AddOperation("plugin", q); };

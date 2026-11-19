@@ -12,13 +12,22 @@
 #include <string>
 #include <vector>
 
+static int Components(adios2::IO& io, const std::string& var) {
+    // Fides cell_grid: variable "<celltype>/<name>" has attribute "<name>/components"
+    const size_t slash = var.find('/');
+    if (slash == std::string::npos) return 1;
+    auto at = io.InquireAttribute<int32_t>(var.substr(slash + 1) + "/components");
+    return at ? std::max(1, at.Data()[0]) : 1;
+}
+
 template <class T>
 static void Compare(adios2::IO& ia, adios2::Engine& ra, adios2::IO& ib, adios2::Engine& rb, const std::string& name, size_t step, FILE* csv) {
     auto va = ia.InquireVariable<T>(name), vb = ib.InquireVariable<T>(name);
     if (!va || !vb) { std::cerr << "  " << name << ": missing in one file\n"; return; }
     const auto blocks = ra.BlocksInfo(va, step);
     const bool global = !va.Shape().empty();
-    double maxerr = 0, sq = 0, ss = 0; double lo = 1e300, hi = -1e300; size_t n = 0;
+    const int ncomp = Components(ia, name);
+    std::vector<double> maxerr(ncomp, 0), sq(ncomp, 0), ss(ncomp, 0), lo(ncomp, 1e300), hi(ncomp, -1e300); std::vector<size_t> n(ncomp, 0);
     std::vector<T> a, b;
     for (size_t k = 0; k < blocks.size(); ++k) {
         size_t cnt = 1; for (auto c : blocks[k].Count) cnt *= c;
@@ -28,14 +37,18 @@ static void Compare(adios2::IO& ia, adios2::Engine& ra, adios2::IO& ib, adios2::
         else { va.SetBlockSelection(k); vb.SetBlockSelection(k); }
         ra.Get(va, a.data(), adios2::Mode::Sync); rb.Get(vb, b.data(), adios2::Mode::Sync);
         for (size_t i = 0; i < cnt; ++i) {
+            const int c = static_cast<int>(i % ncomp);
             const double x = a[i], e = std::fabs(double(a[i]) - double(b[i]));
-            maxerr = std::max(maxerr, e); sq += e * e; ss += x * x; lo = std::min(lo, x); hi = std::max(hi, x); ++n;
+            maxerr[c] = std::max(maxerr[c], e); sq[c] += e * e; ss[c] += x * x; lo[c] = std::min(lo[c], x); hi[c] = std::max(hi[c], x); ++n[c];
         }
     }
-    const double rmse = n ? std::sqrt(sq / n) : 0, rms = n ? std::sqrt(ss / n) : 0, range = hi - lo;
-    std::printf("  step %zu %-32s blocks %3zu  maxerr %.4e  rmse %.4e  maxerr/rms %.3e  rmse/rms %.3e  maxerr/range %.3e\n", step, name.c_str(), blocks.size(), maxerr, rmse,
-                rms > 0 ? maxerr / rms : 0, rms > 0 ? rmse / rms : 0, range > 0 ? maxerr / range : 0);
-    if (csv) std::fprintf(csv, "%zu,%s,%zu,%zu,%.6e,%.6e,%.6e,%.6e\n", step, name.c_str(), blocks.size(), n, maxerr, rmse, rms, range);
+    for (int c = 0; c < ncomp; ++c) {
+        const double rmse = n[c] ? std::sqrt(sq[c] / n[c]) : 0, rms = n[c] ? std::sqrt(ss[c] / n[c]) : 0, range = hi[c] - lo[c];
+        std::string label = name; if (ncomp > 1) label += "[" + std::to_string(c) + "]";
+        std::printf("  step %zu %-34s blocks %3zu  maxerr %.4e  rmse %.4e  maxerr/rms %.3e  rmse/rms %.3e  maxerr/range %.3e\n", step, label.c_str(), blocks.size(), maxerr[c], rmse,
+                    rms > 0 ? maxerr[c] / rms : 0, rms > 0 ? rmse / rms : 0, range > 0 ? maxerr[c] / range : 0);
+        if (csv) std::fprintf(csv, "%zu,%s,%zu,%zu,%.6e,%.6e,%.6e,%.6e\n", step, label.c_str(), blocks.size(), n[c], maxerr[c], rmse, rms, range);
+    }
 }
 
 int main(int argc, char** argv) {

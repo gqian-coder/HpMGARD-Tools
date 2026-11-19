@@ -72,10 +72,15 @@ Per block and component, with base order `p_min` (default 1) and the data order 
    the corner values that share a mesh vertex (`conn[:,0:8]` via the corner permutation
    `[0,1,3,2,4,5,7,6]`), remainder in Hilbert order of the corner coordinates; exact in location because
    the base values sit on the vertices.
-5. **Quantise and code.** Error budget `tol_base·A + tol_res ≤ tol` (A = ‖P_c‖, 1.0 for the L∞ bound,
-   3.95 for the L2 model), `tol_base` split between average and remainder as mp-MGARD does. Each stream
-   is uniformly quantised at its tolerance and losslessly coded (section 2.2). Reconstruction
-   `u' = P_c (avg' + rem') + r'` meets the bound by construction.
+5. **Quantise and code (closed loop).** The residual is taken against the *decoded* base,
+   `r = u − P_c(avg' + rem')`, and quantised with quantum `2·tol`, so the pointwise error of the output is
+   bounded by `tol` regardless of how coarsely the base was coded. The base quantum (`base_quantum_ratio ×
+   2·tol`) is therefore a pure rate-allocation knob (coarser base = fewer base bytes, more residual bytes)
+   that the tuner chooses; `A = ‖P_c‖∞` only governs how much base quantisation noise the residual has to
+   absorb, which is why the closed representation (A = 1.0) still pays. Each stream is coded with a
+   chainable lossless pipeline (section 2.2). Reconstruction `u' = P_c (avg' + rem') + r'`.
+   (Implemented as designed here; this supersedes the open-loop budget `tol_base·A + tol_res ≤ tol` of
+   revision 2, which the emulation used.)
 
 Engine changes versus mp-MGARD: tensor node set selectable (`RPOperatorTable` Gauss / `GLLRPOperatorTable`
 Lobatto behind one `TensorRPTable` interface); E composed into the base restriction and `P_c` into the
@@ -93,14 +98,21 @@ lines in `src/core/`; its output is written into the header and never recomputed
 
 | codec | where it runs | role |
 |---|---|---|
-| `FRBP` (fixed-rate bit packing, cuSZp-style, 32-value blocks: 1 rate byte + sign word + rate×4 bytes) | CPU reference (new) and GPU (ported `frbp_encoding.hip`) | fast mode; no entropy coding, ~100 GB/s on GPU |
-| `HUFF_ZSTD` (MGARD-X lossless: GPU/CPU Huffman + zstd on the Huffman output) | via libmgard on SERIAL/HIP/CUDA; the centroid plugin's `MGARDXLossless_{SERIAL,HIP}.cpp` wrappers are reused | ratio mode; the same coder MGARD-X itself uses |
-| `ZSTD` (host libzstd on the quantised int32 stream, multi-threaded) | CPU | fallback when MGARD-X is absent |
-| `MGARDX` (MGARD-X 1-D on a stream of doubles) | via libmgard | optional coder for the base average stream |
-| `RAW` | | below-threshold or incompressible blocks |
+| `raw` (int32 symbols as bytes) | CPU reference | first stage; useful with `zstd` for testing |
+| `frbp` (fixed-rate bit packing, mp-MGARD FIXED-mode format: 32-value blocks, 1 rate byte + sign word + rate×4 bytes) | CPU reference (new); GPU kernel ported in M2 | first stage; no entropy coding |
+| `huffman[:dict_bits]` (canonical Huffman over zigzag symbols, escaped outliers, codes ≤ 32 bits) | CPU reference (new); GPU in M2 | first stage; the entropy coder |
+| `zstd[:level]` (libzstd frame of the previous stage's bytes) | CPU (libzstd) | any later stage; removes runs/LZ redundancy the entropy coder cannot |
+| `mgardx` (MGARD-X 1-D on a double stream) | libmgard SERIAL/HIP/CUDA | optional base-stream codec and the direct safety-net candidate |
 
-Codec streams are specified in `documents/bitstream.md`; the CPU implementation of FRBP is the reference
-and the GPU kernel must produce identical bytes on identical quantised input (byte test). MGARD-X
+Stages are chained by a spec string (`huffman|zstd:3`, `frbp|zstd:19`, `raw|zstd:3`, `huffman`, ...) so
+coders can be switched and combined for testing from the ADIOS2 parameters or the bench tool; the chain is
+written into the stream container and decoded without parameters. A standing test item: `zstd:3` versus
+`zstd:19` on the same quantised streams (ratio versus time). First measurement on p4 pressure (section 4.1):
+`huffman|zstd:3` 52 KB, `frbp|zstd:3` 54 KB, `frbp` alone 240 KB on the 3% sample; Huffman alone cannot code
+below one bit per symbol, so the LZ/run-length stage after it is what captures sparse residuals.
+
+Codec streams are specified in `documents/bitstream.md`; the CPU implementations are the reference and
+the GPU kernels (M2) must produce identical bytes on identical quantised input (byte test). MGARD-X
 streams are vendor-neutral by construction.
 
 ## 3. Auto-tuning of the hierarchy and budget (your suggestion)
@@ -256,37 +268,17 @@ streams, dequantise, reconstruct → `dataOut`.
 
 ## 7. Metadata header (MGARD-X style)
 
-MGARD-X's `Metadata` is a hand-serialised fixed-field record: `software_version[3]`, `file_version[3]`,
-`metadata_size`, `metadata_crc32`, endianness, then data/decomposition/encoding fields, versions readable
-first (protobuf is used by classic MGARD, not MGARD-X). This header follows that shape. Deviations: a
-small variable-length **stream directory** (needed because a block holds two or three streams now and
-more levels later) and **mesh identity strings** (DEDUP), both as length-prefixed sections inside
-`metadata_size`; codec metadata is serialised field by field, never by struct `memcpy`.
-
-All integers little-endian fixed width, doubles IEEE-754, strings `uint16 len + bytes`.
-
-```
-preamble (fixed, 24 bytes)
-  char[4] magic "HPMG"   uint8 operator_type = 54   uint8 software_version[3]   uint8 file_version[3]   uint8 endianness
-  uint32 metadata_size (bytes after the preamble up to the payload)   uint32 metadata_crc32   uint16 flags
-  flags: bit0 raw block, bit1 mesh identity present, bit2 geometry CRCs present, bit3 directory present (reserved bits for the retrieval extension)
-block            uint64 blockid   uint64 ndims   uint64 dims[ndims]   uint8 data_type
-discretisation   uint8 cell_type   uint8 p   uint16 nsp   uint8 ncomp   uint8 dof_layout   uint8 node_set
-configuration    uint8 base_order   uint8 base_representation (closed)   uint8 n_levels, uint8 levels[n]   uint8 base_method
-                 uint8 base_codec   uint8 residual_codec   uint8 norm   double rel_tol   double var_scale[ncomp]
-                 double base_fraction   double amp_base (‖P_c‖ used)   double avg_tol[ncomp]   double rem_tol[ncomp]   double res_tol[ncomp]
-                 uint8 mgardx_present, double mgardx_s, uint8 mgardx_levels (if a stream uses MGARDX)
-mesh identity    (bit1) str connectivity_variable   str coordinates_variable   uint8 corner_perm_code   uint64 num_vertex_groups
-geometry CRCs    (bit2) uint32 crc32(dof_vid)   uint32 crc32(dof_perm)
-provenance       str hpmgard_git_describe   str mpmgard_source_commit   uint8 mgardx_version[3]   uint8 writer_backend (0 CPU, 1 HIP, 2 CUDA)
-directory        (bit3) uint32 nstreams; per stream: uint8 level_index, uint8 component, uint8 kind (AVG | REMAINDER | RESIDUAL), uint8 codec,
-                 uint64 offset, uint64 bytes, uint64 orig_bytes
-payload          streams in directory order (base streams first, then the residual), component-major within a kind
-```
-
-Readers accept `file_version` in `[1, current]`, skip to the payload via `metadata_size`, verify the CRC,
-and fail with explicit version numbers on anything newer. About 600 bytes per block for `{1,4}` and 3
-components. `hpmgard_meta_dump` prints it.
+MGARD-X's `Metadata` is a hand-serialised, fixed-field record (software and file versions, size, CRC32,
+endianness, then data/decomposition/encoding fields, versions readable first; protobuf is used by classic
+MGARD, not MGARD-X). The implemented header follows that shape and is specified field by field in
+`HpMGARD-Tools/documents/bitstream.md`: a 22-byte preamble (`"HPMG"`, operator type 54, software and
+file versions, endianness, metadata size, CRC32, flags), then block identity, discretisation (shape, p,
+nsp, ncomp, DOF layout, node set), configuration (base order/representation/method, norm, tolerance, per
+component scale, pointwise bound, base and residual quanta, `amp_inf`, codec chain strings, direct flag),
+optional mesh identity (connectivity and coordinate variable names, vertex-group count) and geometry
+CRCs, provenance (writer string, MGARD-X version, backend), and the stream directory (component, kind,
+codec, offset, bytes, count per stream). Readers accept file versions 1.x, verify the CRC and fail with
+explicit version numbers on anything newer. About 300 bytes per block.
 
 ## 8. HpMGARD-Tools repo (drivers, tests, scripts), Unstructured-ReMesh style
 
@@ -306,6 +298,23 @@ HpMGARD-Tools/
 
 Cross-backend matrix: streams from {CPU, HIP, CUDA} × decoders {CPU, HIP, CUDA}; decoded values equal
 across decoders within 1e-12 of the range; error ≤ bound everywhere.
+
+## 8.1 Status (2026-11-19, end of day one)
+
+Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 21):
+- `CompressHpMGARDOperator`: library `hpmgard` (quadrature, tensor and ported simplex operators, closed
+  base, cellavg and dedup/Hilbert base splits, codecs raw/frbp/huffman/zstd with chain container,
+  MGARD-X wrapper, header, closed-loop compressor, tuner) and the ADIOS2 plugin (`Operate`,
+  `InverseOperate`, `MeshAdapter`, self-contained decode via `EngineName`, raw fallback, float support).
+  bpls decodes compressed files once `ADIOS2_PLUGIN_PATH` points at the install (the Cray wrapper's
+  auto-linked libsci must be left out of the build: `runconf_cpu` unloads `cray-libsci` and
+  `darshan-runtime`).
+- `HpMGARD-Tools`: `hpmgard_bench`, `hpmgard_adios_compress` (passthrough driver), `hpmgard_adios_decompress`,
+  `hpmgard_verify`, `hpmgard_adios_roundtrip`, unit tests (5/5 pass), analysis scripts, documents.
+- End to end on the real p1 file (1.6 GB, 13 fields × 5 steps): 11 s wall on 16 threads, every field within
+  its pointwise bound on every step; the 13 fields shrink to about 5 MB, the output (554 MB) is now
+  dominated by the uncompressed mesh that the HODG file rewrites every step.
+- Not done: GPU backends (M2), CUDA/cross-backend matrix (M5), MPI in the drivers, simplex verification.
 
 ## 9. Milestones and functionality checklist
 

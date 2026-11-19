@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
     cfg.base_method = bm == "dedup" ? BaseMethod::DedupSfc : bm == "plain" ? BaseMethod::Plain : BaseMethod::CellAvg;
     cfg.base_quantum_ratio = std::stod(get("base-quantum", "0.5"));
     cfg.base_codec = get("base-codec", "huffman|zstd:3"); cfg.residual_codec = get("residual-codec", "huffman|zstd:3");
-    cfg.tune = a.count("tune") > 0; cfg.tune_sample = std::stod(get("tune-sample", "0.03")); cfg.tune_codecs = get("tune-codecs", "huffman|zstd:3,frbp|zstd:3,frbp");
+    cfg.tune = a.count("tune") > 0; cfg.tune_sample = std::stod(get("tune-sample", "0.03")); cfg.tune_codecs = get("tune-codecs", "huffman|zstd:3,raw|zstd:3,frbp|zstd:3");
     cfg.threads = std::stoi(get("threads", "0")); cfg.verbose = a.count("verbose") > 0;
     cfg.allow_mgardx_direct = get("allow-mgardx-direct", "1") == "1";
 
