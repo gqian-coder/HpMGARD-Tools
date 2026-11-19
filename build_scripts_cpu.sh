@@ -2,6 +2,9 @@
 # Build the tools against an installed CompressHpMGARDOperator (CPU build).
 #   HPMGARD_PREFIX=/path/to/CompressHpMGARDOperator/install-cpu bash build_scripts_cpu.sh [build_dir]
 set -e
+# The Cray wrapper auto-links libsci (static TLS: breaks dlopen of the plugin) and darshan (MPI-only);
+# neither is needed, so unload them for the whole configure + build shell.
+if type module >/dev/null 2>&1; then module unload cray-libsci darshan-runtime 2>/dev/null || true; fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${HPMGARD_PREFIX:-${HERE}/../CompressHpMGARDOperator/install-cpu}"
 BUILD="${1:-${HERE}/build_cpu}"
