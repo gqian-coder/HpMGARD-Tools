@@ -66,6 +66,9 @@ int main() {
     { Case k{"abs tolerance", base(), false}; k.cfg.norm = Norm::Abs; k.cfg.tolerance = 0.7; cases.push_back(k); }
     { Case k{"rel range, base quantum 2", base(), true}; k.cfg.norm = Norm::RelRange; k.cfg.tolerance = 1e-4; k.cfg.base_quantum_ratio = 2.0; k.cfg.base_method = BaseMethod::DedupSfc; cases.push_back(k); }
     if (mgardx::Available()) {
+        // MGARD-X lossless stages on the residual (>= 65536 symbols so the stage is really used; the GPU
+        // path codes the device-resident symbols when the compress device is hip)
+        for (const char* c : {"xhuff|zstd:3", "xhuff:3", "xrle", "xrans"}) { Case k{c, base(), false}; k.cfg.residual_codec = c; cases.push_back(k); }
         { Case k{"mgardx base codec", base(), false}; k.cfg.base_codec = "mgardx"; cases.push_back(k); }
         { Case k{"direct mgardx", base(), false}; k.cfg.direct_mgardx = true; cases.push_back(k); }
     }

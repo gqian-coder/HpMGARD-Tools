@@ -4,7 +4,7 @@
 //   hpmgard_bench --raw field.bin --ncells N --p 4 [--shape hexahedron] [--ncomp 1]
 //                 --tol 1e-3 [--norm rel_l2|rel_range|abs]
 //                 [--tune | --base-order 1 --base-method cellavg|dedup|plain --base-quantum 0.5
-//                  --base-codec "huffman|zstd:3" --residual-codec "huffman|zstd:3" --node-set gauss|lobatto]
+//                  --base-codec "huffman|zstd:3" --residual-codec "huffman|zstd:3" --node-set gauss|lobatto --warmup]
 //                 [--conn conn.bin --points points.bin --nodes-per-cell 27]   (int64 / double raw dumps; enables dedup)
 //                 [--mgardx-direct]  [--threads 16] [--label name] [--csv out.csv] [--verbose]
 #include <hpmgard/hpmgard.h>
@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
     }
 
     BlockMeta meta; meta.dims = {ncells, static_cast<uint64_t>(nsp) * cfg.ncomp};
+    if (a.count("warmup")) { CompressResult w = Compress(field, cfg, mesh_ptr, meta); (void)w; }   // untimed run: kernel loading, workspaces
     const auto t0 = Clock::now();
     CompressResult r = Compress(field, cfg, mesh_ptr, meta);
     const double t_comp = Sec(t0, Clock::now());

@@ -30,7 +30,7 @@ int main() {
     // MGARD-X Huffman stage (xhuff): only when the library was built with MGARD-X. Device 0 = SERIAL;
     // a stream coded on any device must decode on device 0 (the stream is device-agnostic).
     const bool have_xhuff = StageAvailable(StageId::MgardXHuffman, 0);
-    if (have_xhuff) { chains.push_back("xhuff"); chains.push_back("xhuff:3"); chains.push_back("xhuff|zstd:3"); }
+    if (have_xhuff) { chains.push_back("xhuff"); chains.push_back("xhuff:3"); chains.push_back("xhuff|zstd:3"); chains.push_back("xrle"); chains.push_back("xrans"); chains.push_back("xrle|zstd:3"); }
     else std::fprintf(stderr, "note: MGARD-X not available, skipping xhuff chains\n");
     for (const std::string& spec : chains) {
         const std::vector<Stage> chain = ParseChain(spec);
@@ -85,22 +85,26 @@ int main() {
     }
     if (have_xhuff) {
         // wide symbols fall outside the 8192-entry MGARD-X dictionary -> the stage must fall back (mode byte 0) and still round-trip
-        const std::vector<int32_t> wide = MakeStream(5000, 2, rng);
-        const std::vector<uint8_t> b = EncodeSymbols(wide.data(), wide.size(), ParseChain("xhuff"));
-        std::vector<int32_t> back; DecodeSymbols(b.data(), b.size(), back);
-        CHECK(back == wide);
+        for (const char* spec : {"xhuff", "xrle", "xrans"}) {
+            const std::vector<int32_t> wide = MakeStream(70000, 2, rng);
+            const std::vector<uint8_t> b = EncodeSymbols(wide.data(), wide.size(), ParseChain(spec));
+            std::vector<int32_t> back; DecodeSymbols(b.data(), b.size(), back);
+            CHECK(back == wide);
+        }
         // encode on the device named by HPMGARD_TEST_DEVICE (1 = HIP) if any, decode on the CPU
         const char* dev_env = std::getenv("HPMGARD_TEST_DEVICE");
         const int dev = dev_env ? ((std::string(dev_env) == "hip") ? 1 : (std::string(dev_env) == "cuda") ? 2 : 0) : 0;
         if (dev != 0 && StageAvailable(StageId::MgardXHuffman, dev)) {
-            const std::vector<int32_t> v = MakeStream(300000, 1, rng);
-            const std::vector<uint8_t> bd = EncodeSymbols(v.data(), v.size(), ParseChain("xhuff|zstd:3"), 0.0, dev);
-            const std::vector<uint8_t> bh = EncodeSymbols(v.data(), v.size(), ParseChain("xhuff|zstd:3"), 0.0, 0);
-            std::vector<int32_t> back_d; DecodeSymbols(bd.data(), bd.size(), back_d, 0);
-            CHECK(back_d == v);
-            std::vector<int32_t> back_h; DecodeSymbols(bh.data(), bh.size(), back_h, dev);
-            CHECK(back_h == v);
-            std::fprintf(stderr, "xhuff device %d: %zu bytes, cpu: %zu bytes (%s)\n", dev, bd.size(), bh.size(), bd == bh ? "identical" : "different streams");
+            for (const char* spec : {"xhuff|zstd:3", "xhuff:3", "xrle", "xrans"}) {
+                const std::vector<int32_t> v = MakeStream(300000, 1, rng);
+                const std::vector<uint8_t> bd = EncodeSymbols(v.data(), v.size(), ParseChain(spec), 0.0, dev);
+                const std::vector<uint8_t> bh = EncodeSymbols(v.data(), v.size(), ParseChain(spec), 0.0, 0);
+                std::vector<int32_t> back_d; DecodeSymbols(bd.data(), bd.size(), back_d, 0);
+                CHECK(back_d == v);
+                std::vector<int32_t> back_h; DecodeSymbols(bh.data(), bh.size(), back_h, dev);
+                CHECK(back_h == v);
+                std::fprintf(stderr, "%s device %d: %zu bytes, cpu: %zu bytes (%s)\n", spec, dev, bd.size(), bh.size(), bd == bh ? "identical" : "different streams");
+            }
         }
     }
     CHECK_THROWS(ParseChain("zstd:3|huffman"));
