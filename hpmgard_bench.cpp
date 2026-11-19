@@ -37,7 +37,7 @@ int main(int argc, char** argv) {
         std::string k = argv[i];
         if (k.rfind("--", 0) != 0) { std::cerr << "unexpected argument " << k << "\n"; return 2; }
         k = k.substr(2);
-        if (k == "tune" || k == "mgardx-direct" || k == "verbose") a[k] = "1";
+        if (k == "tune" || k == "mgardx-direct" || k == "verbose" || k == "warmup") a[k] = "1";
         else { if (i + 1 >= argc) { std::cerr << "missing value for --" << k << "\n"; return 2; } a[k] = argv[++i]; }
     }
     auto get = [&](const std::string& k, const std::string& d) { auto it = a.find(k); return it == a.end() ? d : it->second; };
