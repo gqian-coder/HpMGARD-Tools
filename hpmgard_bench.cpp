@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     cfg.base_quantum_ratio = std::stod(get("base-quantum", "0.5"));
     cfg.base_codec = get("base-codec", "huffman|zstd:3"); cfg.residual_codec = get("residual-codec", "huffman|zstd:3");
     cfg.tune = a.count("tune") > 0; cfg.tune_sample = std::stod(get("tune-sample", "0.03")); cfg.tune_codecs = get("tune-codecs", "huffman|zstd:3,raw|zstd:3,frbp|zstd:3");
-    cfg.threads = std::stoi(get("threads", "0")); cfg.verbose = a.count("verbose") > 0;
+    cfg.device = get("device", "auto"); cfg.threads = std::stoi(get("threads", "0")); cfg.verbose = a.count("verbose") > 0;
     cfg.allow_mgardx_direct = get("allow-mgardx-direct", "1") == "1";
 
     const std::vector<double> data = ReadRaw<double>(a["raw"]);
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     const double t_comp = Sec(t0, Clock::now());
     const auto t1 = Clock::now();
     std::vector<double> out; BlockHeader h;
-    Decompress(r.bytes.data(), r.bytes.size(), mesh_ptr, out, &h);
+    Decompress(r.bytes.data(), r.bytes.size(), mesh_ptr, out, &h, get("decode-device", cfg.device));
     const double t_dec = Sec(t1, Clock::now());
     double maxerr = 0, sq = 0; double maxrel = 0;
     for (int v = 0; v < cfg.ncomp; ++v) {
@@ -108,27 +108,31 @@ int main(int argc, char** argv) {
             const double tol = h.tol_abs[v];
             for (int mode = 0; mode < 2; ++mode) {
                 const double s = mode == 0 ? std::numeric_limits<double>::infinity() : 0.0;
-                const auto ta = Clock::now();
-                std::vector<uint8_t> b = mgardx::Compress1D(comp.data(), comp.size(), tol, s, 0);
-                const double tc = Sec(ta, Clock::now());
-                std::vector<double> d; mgardx::Decompress(b.data(), b.size(), d);
-                double me = 0; for (size_t i = 0; i < comp.size(); ++i) me = std::max(me, std::fabs(d[i] - comp[i]));
-                if (mode == 0) { total_inf += b.size(); t_mx_inf += tc; err_mx_inf = std::max(err_mx_inf, me / tol); }
-                else { total_0 += b.size(); t_mx_0 += tc; err_mx_0 = std::max(err_mx_0, me / tol); }
+                const int mdev = get("mgardx-device", get("device", "auto")) == "hip" ? 1 : 0;
+                try {
+                    const auto ta = Clock::now();
+                    std::vector<uint8_t> b = mgardx::Compress1D(comp.data(), comp.size(), tol, s, 0, mdev);
+                    const double tc = Sec(ta, Clock::now());
+                    std::vector<double> d; mgardx::Decompress(b.data(), b.size(), d, mdev);
+                    double me = 0; for (size_t i = 0; i < comp.size(); ++i) me = std::max(me, std::fabs(d[i] - comp[i]));
+                    if (mode == 0) { total_inf += b.size(); t_mx_inf += tc; err_mx_inf = std::max(err_mx_inf, me / tol); }
+                    else { total_0 += b.size(); t_mx_0 += tc; err_mx_0 = std::max(err_mx_0, me / tol); }
+                } catch (const std::exception& e) { std::cerr << "MGARD-X reference failed (device " << mdev << ", s=" << s << "): " << e.what() << "\n"; }
             }
         }
-        cr_mx_inf = double(r.stats.raw_bytes) / total_inf; cr_mx_0 = double(r.stats.raw_bytes) / total_0;
+        cr_mx_inf = total_inf ? double(r.stats.raw_bytes) / total_inf : 0; cr_mx_0 = total_0 ? double(r.stats.raw_bytes) / total_0 : 0;
     }
     const std::string label = get("label", a["raw"]);
     const bool header = !a.count("csv") || !std::ifstream(a["csv"]).good();
     FILE* out_f = a.count("csv") ? std::fopen(a["csv"].c_str(), "a") : stdout;
-    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0\n");
+    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0,device,t_stats,t_refactor,t_base,t_residual,t_code\n");
     const CompressConfig& u = r.stats.used;
-    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f\n",
+    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.3f\n",
                  label.c_str(), ncells, cfg.p, cfg.ncomp, norm.c_str(), cfg.tolerance, h.tol_abs[0],
                  (unsigned long long)r.stats.raw_bytes, (unsigned long long)r.stats.compressed_bytes, r.stats.ratio(), maxrel, rmse, t_comp, t_dec, r.stats.t_tune,
                  u.base_order, u.base_method == BaseMethod::DedupSfc ? "dedup" : u.base_method == BaseMethod::CellAvg ? "cellavg" : "plain", u.base_quantum_ratio,
-                 u.base_codec.c_str(), u.residual_codec.c_str(), u.direct_mgardx ? 1 : 0, cr_mx_inf, err_mx_inf, t_mx_inf, cr_mx_0, err_mx_0, t_mx_0);
+                 u.base_codec.c_str(), u.residual_codec.c_str(), u.direct_mgardx ? 1 : 0, cr_mx_inf, err_mx_inf, t_mx_inf, cr_mx_0, err_mx_0, t_mx_0,
+                 h.writer.c_str(), r.stats.t_stats, r.stats.t_refactor, r.stats.t_base, r.stats.t_residual, r.stats.t_code);
     if (out_f != stdout) std::fclose(out_f);
     if (maxrel > 1.0 + 1e-9) { std::cerr << "ERROR: bound violated (max err / tol = " << maxrel << ")\n"; return 4; }
     return 0;
