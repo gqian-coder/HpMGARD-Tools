@@ -58,7 +58,8 @@ int main() {
     const char* dev_env = std::getenv("HPMGARD_TEST_DEVICE"); const std::string dev = dev_env ? dev_env : "cpu";
     std::printf("compress device: %s, decompress device: cpu\n", dev.c_str());
     auto base = [&]() { CompressConfig c; c.shape = ElemShape::HEX; c.p = 4; c.ncomp = 1; c.norm = Norm::RelL2; c.tolerance = 1e-3; c.threads = 4; c.device = dev; return c; };
-    { Case k{"cellavg huffman|zstd", base(), false}; cases.push_back(k); }
+    { Case k{"cellavg auto codec", base(), false}; cases.push_back(k); }
+    { Case k{"cellavg huffman|zstd", base(), false}; k.cfg.base_codec = "huffman|zstd:3"; k.cfg.residual_codec = "huffman|zstd:3"; cases.push_back(k); }
     { Case k{"dedup frbp|zstd", base(), true}; k.cfg.base_method = BaseMethod::DedupSfc; k.cfg.base_codec = "frbp|zstd:3"; k.cfg.residual_codec = "frbp|zstd:3"; cases.push_back(k); }
     { Case k{"cell mean (p_base 0) frbp", base(), false}; k.cfg.base_order = 0; k.cfg.base_method = BaseMethod::Plain; k.cfg.base_codec = "frbp"; k.cfg.residual_codec = "frbp"; cases.push_back(k); }
     { Case k{"no split (p_base 4) raw|zstd", base(), false}; k.cfg.base_order = 4; k.cfg.base_method = BaseMethod::Plain; k.cfg.base_codec = "raw|zstd:3"; k.cfg.residual_codec = "raw|zstd:3"; cases.push_back(k); }
@@ -80,6 +81,10 @@ int main() {
         std::vector<double> out; BlockHeader h;
         Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out, &h, "cpu");
         CHECK(out.size() == s.data.size());
+        if (dev != "cpu") {   // decode on the GPU too (device decode + reconstruction from device symbols) and compare with the CPU decode
+            std::vector<double> out_dev; Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out_dev, nullptr, dev);
+            CHECK(out_dev == out);
+        }
         const double tol_abs = h.tol_abs[0];
         const double err = MaxErr(s.data, out);
         CHECK(err <= tol_abs * (1 + 1e-9));

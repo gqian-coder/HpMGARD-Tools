@@ -54,8 +54,8 @@ int main(int argc, char** argv) {
     const std::string bm = get("base-method", "cellavg");
     cfg.base_method = bm == "dedup" ? BaseMethod::DedupSfc : bm == "plain" ? BaseMethod::Plain : BaseMethod::CellAvg;
     cfg.base_quantum_ratio = std::stod(get("base-quantum", "0.5"));
-    cfg.base_codec = get("base-codec", "huffman|zstd:3"); cfg.residual_codec = get("residual-codec", "huffman|zstd:3");
-    cfg.tune = a.count("tune") > 0; cfg.tune_sample = std::stod(get("tune-sample", "0.03")); cfg.tune_codecs = get("tune-codecs", "huffman|zstd:3,raw|zstd:3,frbp|zstd:3");
+    cfg.base_codec = get("base-codec", "auto"); cfg.residual_codec = get("residual-codec", "auto");
+    cfg.tune = a.count("tune") > 0; cfg.tune_sample = std::stod(get("tune-sample", "0.03")); cfg.tune_codecs = get("tune-codecs", "auto");
     cfg.device = get("device", "auto"); cfg.threads = std::stoi(get("threads", "0")); cfg.verbose = a.count("verbose") > 0;
     cfg.allow_mgardx_direct = get("allow-mgardx-direct", "1") == "1";
 
@@ -83,7 +83,10 @@ int main(int argc, char** argv) {
     }
 
     BlockMeta meta; meta.dims = {ncells, static_cast<uint64_t>(nsp) * cfg.ncomp};
-    if (a.count("warmup")) { CompressResult w = Compress(field, cfg, mesh_ptr, meta); (void)w; }   // untimed run: kernel loading, workspaces
+    if (a.count("warmup")) {   // untimed round trip: kernel loading, MGARD-X workspaces, pinned scratch of both directions
+        CompressResult w = Compress(field, cfg, mesh_ptr, meta);
+        std::vector<double> wo; Decompress(w.bytes.data(), w.bytes.size(), mesh_ptr, wo, nullptr, get("decode-device", cfg.device));
+    }
     const auto t0 = Clock::now();
     CompressResult r = Compress(field, cfg, mesh_ptr, meta);
     const double t_comp = Sec(t0, Clock::now());
