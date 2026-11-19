@@ -1,6 +1,7 @@
 #include "check.h"
 #include <hpmgard/hpmgard.h>
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <vector>
 using namespace hpmgard;
@@ -53,7 +54,10 @@ int main() {
 
     struct Case { const char* name; CompressConfig cfg; bool mesh; };
     std::vector<Case> cases;
-    auto base = [&]() { CompressConfig c; c.shape = ElemShape::HEX; c.p = 4; c.ncomp = 1; c.norm = Norm::RelL2; c.tolerance = 1e-3; c.threads = 4; return c; };
+    // HPMGARD_TEST_DEVICE=hip compresses on the GPU and decodes on the CPU (cross-backend check)
+    const char* dev_env = std::getenv("HPMGARD_TEST_DEVICE"); const std::string dev = dev_env ? dev_env : "cpu";
+    std::printf("compress device: %s, decompress device: cpu\n", dev.c_str());
+    auto base = [&]() { CompressConfig c; c.shape = ElemShape::HEX; c.p = 4; c.ncomp = 1; c.norm = Norm::RelL2; c.tolerance = 1e-3; c.threads = 4; c.device = dev; return c; };
     { Case k{"cellavg huffman|zstd", base(), false}; cases.push_back(k); }
     { Case k{"dedup frbp|zstd", base(), true}; k.cfg.base_method = BaseMethod::DedupSfc; k.cfg.base_codec = "frbp|zstd:3"; k.cfg.residual_codec = "frbp|zstd:3"; cases.push_back(k); }
     { Case k{"cell mean (p_base 0) frbp", base(), false}; k.cfg.base_order = 0; k.cfg.base_method = BaseMethod::Plain; k.cfg.base_codec = "frbp"; k.cfg.residual_codec = "frbp"; cases.push_back(k); }
@@ -71,7 +75,7 @@ int main() {
         CompressResult r = Compress(f, k.cfg, k.mesh ? &s.mesh : nullptr, meta);
         CHECK_THROWS(Compress(f, k.cfg, k.mesh ? &s.mesh : nullptr, BlockMeta{0, {1, 2}, 0, "", ""}));
         std::vector<double> out; BlockHeader h;
-        Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out, &h);
+        Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out, &h, "cpu");
         CHECK(out.size() == s.data.size());
         const double tol_abs = h.tol_abs[0];
         const double err = MaxErr(s.data, out);
