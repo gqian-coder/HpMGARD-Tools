@@ -104,3 +104,41 @@ field's redundancy is that repetition rather than low symbol entropy (the Huffma
 bits per symbol). The rANS types without zstd land at CR 35-40 like plain Huffman and their CPU decode is
 slower; they remain available as options. Whether the size gap persists on a developed-flow field, which
 has no exact layer repetition, must be measured on such data before the GPU default is chosen.
+
+## Addendum, 13:00: GPU path with the auto codec, no host round trips, pinned scratch, sweep/prolong kernels (job 5951809, MI250X frontier00062)
+
+Changes since the previous addendum (operator commits 7691dc2, cdad282, 8508848): `xhuff|zstd:3` is the
+default codec on a GPU where MGARD-X works (`auto`); the residual symbols never leave the device on compress
+(coded in place by MGARD-X, the host copy is fetched only on a fallback); on decompress MGARD-X decodes on
+the device and the reconstruction kernel reads the symbols there; host scratch is pinned and persists in a
+process-wide backend instance; restriction uses register-resident tensor sweeps and prolongation a
+thread-per-output kernel with on-the-fly Kronecker weights; the MGARD-X dictionary adapts to the stream's
+code range (256 to 8192, recorded in the payload). Warm-up excluded, 16 host threads, p4 pressure step 0.
+CSV: `documents/gpu/mi250x_gpu_path_2026-11-19.csv`.
+
+| tol | run | bytes | CR | compress s | refactor | base | residual | code | decompress s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1e-3 | hip, auto (xhuff\|zstd:3), decode on hip | 418,749 | 632 | 0.087 | 0.009 | 0.025 | 0.003 | 0.038 | 0.183 |
+| 1e-3 | hip, auto, decode on cpu | 418,749 | 632 | 0.089 | | | | | 0.300 |
+| 1e-3 | hip, huffman\|zstd:3 (in-house), decode on cpu | 129,189 | 2048 | 0.175 | 0.009 | 0.020 | 0.008 | 0.115 | 0.358 |
+| 1e-3 | cpu, auto (= huffman\|zstd:3) | 129,189 | 2048 | 0.366 | 0.007 | 0.021 | 0.116 | 0.111 | 0.392 |
+| 1e-3 | cpu compress, decode on hip | 129,189 | 2048 | 0.270 | | | | | 0.257 |
+| 1e-2 | hip, auto, decode on hip | 111,978 | 2363 | 0.079 | 0.009 | 0.023 | 0.003 | 0.030 | 0.159 |
+| 1e-2 | hip, in-house | 37,914 | 6980 | 0.168 | | | | 0.108 | 0.344 |
+| 1e-4 | hip, auto, decode on hip | 993,734 | 266 | 0.092 | 0.009 | 0.019 | 0.003 | 0.043 | 0.135 |
+| 1e-4 | hip, in-house | 376,163 | 704 | 0.187 | | | | 0.127 | 0.390 |
+| 1e-3 | hip, tuned (auto list) -> raw\|zstd:3 | 155,492 | 1702 | 0.628 (0.470 tuning) | | | | 0.102 | 0.178 |
+
+All runs met the pointwise bound exactly; the GPU decode of every symbol-stream case equals the CPU decode
+bit for bit (test_compressor, 85 checks, including xhuff/xrle/xrans and the dedup base); only MGARD-X's own
+double streams (base codec `mgardx`, direct) differ between its SERIAL and HIP inverse transforms and are
+checked against the bound instead.
+
+Reading: the whole GPU compress of a 264.6 MB field now takes 0.087 s (the morning's resident-component
+version took 0.318 s and the in-house chain on the same GPU 0.175 s); the residual stage dropped from
+0.024 s with the per-cell sweep to 0.003 s with the thread-per-output prolongation, and the symbol coder
+to 0.038 s of which about 0.03 s is the host zstd behind MGARD-X's Huffman. GPU decompress is 0.18 s against
+0.30 s for the CPU decode of the same stream and 0.39 s for the CPU-only path. The remaining size gap to the
+in-house chain on this field (419 KB vs 129 KB) is the layer-repetition effect discussed above; on a
+developed-flow field it has to be re-measured before the GPU default is final. MGARD-X HIP Huffman streams
+remain byte-identical to the SERIAL ones; `xrle` streams differ in bytes between devices but decode on both.
