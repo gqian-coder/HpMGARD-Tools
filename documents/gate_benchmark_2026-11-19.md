@@ -80,3 +80,19 @@ paper measured on developed rotor data; this dataset is an initial transient and
 but the ordering is consistent). Speed: met on CPU, 6.7x faster single-threaded and 13x with 16 threads
 against MGARD-X serial at equal bound. The GPU backend (M2) still has to be measured against MGARD-X
 HIP.
+
+## Addendum: first HIP backend measurement (login03, MI210, 2026-11-19 10:10)
+
+`HODG/results/gate/gpu_login03.csv`, p4 pressure, eb 1e-3, fixed p1 cell-average configuration:
+
+| backend | compress s | decompress s | CR | stages (stats / refactor / base / residual / code) |
+|---|---|---|---|---|
+| CPU, 16 threads | 0.28 | 0.34 | 2048.5 | 0.008 / 0.016 / 0.018 / 0.071 / 0.119 |
+| HIP (naive, per-call staging) | 0.46 | 0.28 | 2048.5 | 0.008 / 0.057 / 0.020 / 0.213 / 0.119 |
+| HIP compress, CPU decode | 0.32 | 0.26 | 2048.5 | cross-backend: identical bytes, bound met |
+
+The streams are byte-identical between CPU and HIP. The naive HIP backend loses time moving 264 MB
+arrays over PCIe for every stage, and the host-side Huffman+zstd coding is the largest single stage on
+both backends; device-resident data and GPU codecs are therefore the next two steps. MGARD-X's own HIP
+compressor returns status 1 on this MI210 (a known MGARD issue; it works on the MI250X compute nodes),
+so the GPU comparison against MGARD-X has to be made on a compute node.
