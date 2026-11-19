@@ -103,6 +103,19 @@ lines in `src/core/`; its output is written into the header and never recomputed
 | `huffman[:dict_bits]` (canonical Huffman over zigzag symbols, escaped outliers, codes ≤ 32 bits) | CPU reference (new); GPU in M2 | first stage; the entropy coder |
 | `zstd[:level]` (libzstd frame of the previous stage's bytes) | CPU (libzstd) | any later stage; removes runs/LZ redundancy the entropy coder cannot |
 | `mgardx` (MGARD-X 1-D on a double stream) | libmgard SERIAL/HIP/CUDA | optional base-stream codec and the direct safety-net candidate |
+| `xhuff[:L]` (MGARD-X Huffman; `:L` = Huffman + zstd level L inside MGARD-X) | libmgard SERIAL or HIP, chosen by the backend device | first stage; GPU entropy coder, bitstream identical on every device |
+| `xrle` (MGARD-X ZeroRLE_Rans: zero run lengths + rANS) | libmgard SERIAL or HIP | first stage; plain option, no sparsity assumption |
+| `xrans` (MGARD-X SymbolRans) | libmgard SERIAL or HIP | first stage; plain option |
+
+The MGARD-X stages (added 2026-11-19) code the residual symbols straight from device memory when the HIP
+backend produced them (`Backend::DeviceSymbols()`): zigzag and range check run on the device, the buffer
+is wrapped without a copy, one MGARD-X compressor object per (type, dictionary, block, length) persists
+for the process, and the first call per type is a warm-up. Every MGARD-X stage falls back to the in-house
+Huffman (a mode byte records it) when a code is outside the dictionary (8192, `HPMGARD_XHUFF_DICT`), the
+stream is shorter than 65536 symbols, MGARD-X fails or does not pass its device preflight (Frontier
+login-node MI210s), or the decode-and-compare check after encoding fails (`HPMGARD_XHUFF_VERIFY=0`
+skips it). The rANS types fall back on one-symbol alphabets (MGARD-X segfaults there). Results are in
+`documents/mgardx_gpu_huffman_2026-11-19.md`.
 
 Stages are chained by a spec string (`huffman|zstd:3`, `frbp|zstd:19`, `raw|zstd:3`, `huffman`, ...) so
 coders can be switched and combined for testing from the ADIOS2 parameters or the bench tool; the chain is
@@ -300,6 +313,11 @@ Cross-backend matrix: streams from {CPU, HIP, CUDA} × decoders {CPU, HIP, CUDA}
 across decoders within 1e-12 of the range; error ≤ bound everywhere.
 
 ## 8.1 Status (2026-11-19, end of day one)
+
+Update 2026-11-19 afternoon: HIP backend with device-resident components and fused residual/reconstruct
+kernels; MGARD-X lossless stages `xhuff`/`xrle`/`xrans` with the device-resident encode path and the
+`mgardx::DeviceWorks` preflight; compute-node validation (MI250X) of the GPU path and of MGARD-X direct;
+the login-node MI210 is known to break MGARD-X's HIP Huffman encoder (falls back automatically).
 
 Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 21):
 - `CompressHpMGARDOperator`: library `hpmgard` (quadrature, tensor and ported simplex operators, closed
