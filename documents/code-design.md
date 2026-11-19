@@ -322,7 +322,10 @@ Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 
   round trip on `device=auto`) passes on the MI210. MGARD-X streams follow the backend device at run time.
   First GPU timing (p4 pressure, 1e-3, fixed config): CPU 16 threads 0.28 s, naive HIP 0.46 s with
   byte-identical output; the HIP residual stage spends 0.21 s staging 264 MB arrays per call and the
-  host-side Huffman+zstd coding (0.12 s) is the largest stage on both backends. Resume at:
+  host-side Huffman+zstd coding (0.12 s) is the largest stage on both backends. Device-resident data (one
+  upload and one fused residual/reconstruct pass per component) then brought the HIP residual stage to
+  0.02 s and the HIP compressor to 0.25 s, parity with 16 CPU threads, with byte-identical streams in both
+  cross-backend directions. Resume at:
   device-resident data across stages, tensor-sweep kernels, GPU FRBP/Huffman with the byte-identity test,
   MGARD-X HIP device type, CUDA via the compat shim.
 - Not done: CUDA/cross-backend matrix (M5), MPI in the drivers, simplex verification, parallel Huffman/zstd.

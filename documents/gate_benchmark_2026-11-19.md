@@ -96,3 +96,20 @@ arrays over PCIe for every stage, and the host-side Huffman+zstd coding is the l
 both backends; device-resident data and GPU codecs are therefore the next two steps. MGARD-X's own HIP
 compressor returns status 1 on this MI210 (a known MGARD issue; it works on the MI250X compute nodes),
 so the GPU comparison against MGARD-X has to be made on a compute node.
+
+## Addendum 2: device-resident HIP backend (login03, MI210, 10:15)
+
+Each component is now uploaded once and stays on the device; the residual is formed and quantised on
+the GPU against the prolonged base in one fused pass, and decoding reconstructs in one fused pass
+(`HODG/results/gate/gpu_login03_resident.csv`, p4 pressure, eb 1e-3, fixed configuration):
+
+| backend | compress s | decompress s | stages (stats / refactor / base / residual / code) |
+|---|---|---|---|
+| CPU, 16 threads | 0.27 | 0.34 | 0.008 / 0.012 / 0.018 / 0.069 / 0.114 |
+| HIP, resident | 0.25 | 0.27 | 0.008 / 0.019 / 0.019 / 0.020 / 0.107 |
+| HIP compress, CPU decode | 0.26 | 0.28 | identical bytes |
+| CPU compress, HIP decode | 0.32 | 0.45 (one outlier of 3.3 s, not reproducible) | identical bytes |
+
+The residual stage dropped from 0.21 s to 0.02 s and the HIP compressor is now at parity with 16 CPU
+threads on this small field; the host-side Huffman+zstd coding (0.11 s) is the remaining bottleneck on
+both backends, so the GPU codecs come next.
