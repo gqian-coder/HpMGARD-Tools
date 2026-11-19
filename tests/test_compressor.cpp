@@ -81,13 +81,16 @@ int main() {
         std::vector<double> out; BlockHeader h;
         Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out, &h, "cpu");
         CHECK(out.size() == s.data.size());
-        if (dev != "cpu") {   // decode on the GPU too (device decode + reconstruction from device symbols) and compare with the CPU decode
-            std::vector<double> out_dev; Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out_dev, nullptr, dev);
-            CHECK(out_dev == out);
-        }
         const double tol_abs = h.tol_abs[0];
         const double err = MaxErr(s.data, out);
         CHECK(err <= tol_abs * (1 + 1e-9));
+        if (dev != "cpu") {   // decode on the GPU too (device decode + reconstruction from device symbols) and compare with the CPU decode
+            std::vector<double> out_dev; Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out_dev, nullptr, dev);
+            // symbol streams reconstruct identically on every backend; MGARD-X double streams (base codec mgardx,
+            // direct) are decoded by MGARD-X's own SERIAL vs GPU inverse transforms, which differ in rounding
+            if (k.cfg.base_codec == "mgardx" || k.cfg.direct_mgardx) CHECK(MaxErr(out_dev, s.data) <= tol_abs * (1 + 1e-9));
+            else CHECK(out_dev == out);
+        }
         CHECK(h.blockid == 7 && h.p == 4 && h.nsp == 125 && h.ncomp == 1);
         std::printf("  %-38s CR %7.2f  max err %.3e / tol %.3e  (%s)\n", k.name, r.stats.ratio(), err, tol_abs, r.stats.used.direct_mgardx ? "direct" : (r.stats.used.base_method == BaseMethod::DedupSfc ? "dedup" : "cellavg/plain"));
         if (k.cfg.tune) std::printf("%s", r.stats.tune_report.c_str());
