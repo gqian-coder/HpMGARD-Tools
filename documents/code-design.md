@@ -215,22 +215,33 @@ is settled by the M1 gate, not by this table.
 
 ## 5. Backends
 
-One `Backend` interface, three implementations; the compressed format is backend-independent.
+One `Backend` interface (`src/hpmgard/Backend.h`), implemented by the CPU backend (OpenMP) and by one GPU
+backend source compiled twice: `BackendDevice.inc` is written against the HIP runtime API and becomes
+`BackendHIP.hip` (AMD) and `BackendCUDA.cu` (NVIDIA) through `DeviceShim.h`, which maps the API names
+(the same approach as mp-MGARD's compat header). The compressed format is backend-independent.
 
-| operation | CPU (new, OpenMP) | HIP / CUDA (ported mp-MGARD kernels) |
+| operation | CPU (OpenMP) | HIP / CUDA (shared device source) |
 |---|---|---|
-| statistics (min/max/sum-sq per component) | loops | `field_stats.hip` |
-| restriction / E / prolongation (Kronecker for HEX/QUAD, dense for TET/PRISM/PYRAMID) | `ApplyRestrict/ApplyProlong` exist; Kronecker sweeps added | `gpu_kernels.hip`, `nek_gpu_rp_pipeline.h` (+ E kernel) |
-| cellavg split, dedup gather/scatter | loops | `nek5000_cellavg_split.hip`, `dedup_gpu.hip` |
-| Hilbert order, dedup groups | host only, integer-quantised coordinates (both backends) | same host code |
-| quantise + FRBP | reference implementation | `frbp_encoding.hip` |
-| HUFF_ZSTD / MGARDX | libmgard SERIAL | libmgard HIP / CUDA |
+| statistics (min/max/sum-sq per component) | loops | host (cheap) |
+| restriction / prolongation | tensor sweeps (`ApplyTensor`) for HEX/QUAD, dense for TET/PRISM/PYRAMID | one thread per cell, register-resident tensor sweeps in the CPU's summation order (`Tensor3Kernel`/`Tensor2Kernel`, sizes up to 512 intermediates); dense kernel for simplex shapes; 1-D operator uploaded once and cached |
+| residual quantisation, reconstruction | loops | fused kernels on the resident component: `ResidualFromBase` (symbols stay on the device), `ReconstructFromDeviceSymbols` (symbols arrive from the device decoder) |
+| cellavg / dedup base splits, Hilbert order | host | host (small arrays) |
+| symbol coding | in-house Huffman/FRBP + zstd, or MGARD-X SERIAL | MGARD-X HIP/CUDA stages on the device-resident symbols (`xhuff`, `xrle`, `xrans`), zstd on the host |
+| MGARD-X direct / base codec | libmgard SERIAL | libmgard HIP / CUDA |
 | auto-tuner | host driver over the backend's sample encodes | same |
 
+GPU backends are one process-wide instance per device type: device buffers, the pinned host scratch
+handed to the compressor for the arrays that cross the link (`Backend::HostScratch`, slots for the
+component, residual symbols, base, decoded base and output) and the uploaded operator persist across calls,
+so repeated blocks pay no allocation or pinning. `MakeBackend` returns a proxy to that instance. The
+backends are not thread safe (one compressor per process, as in the ADIOS2 plugin).
+
 Rules: residuals are floating point, so different backends may emit different (both valid) streams for
-the same input; every backend must decode every valid stream within the bound. Permutations are
-computed on the host from integer-quantised coordinates and protected by CRCs. `device=auto` picks a GPU
-when present, else CPU; `device=cpu` forces the CPU path (used by the cross-backend tests).
+the same input; every backend must decode every valid stream within the bound (the HIP tensor-sweep kernels
+have so far produced byte-identical streams to the CPU on the VKI fields). Permutations are computed on
+the host from integer-quantised coordinates and protected by CRCs. `device=auto` picks a GPU when
+present, else CPU; `device=cpu` forces the CPU path (used by the cross-backend tests). The CUDA build is
+wired (`HPMGARD_ENABLE_CUDA`) but has not been compiled or run: Frontier has no NVIDIA hardware or nvcc.
 
 ## 6. Operator (`CompressHpMGARDOperator` repo, `src/`)
 
