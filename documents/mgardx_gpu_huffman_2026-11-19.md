@@ -65,3 +65,42 @@ array, the MGARD-X workspace allocation, and (for the verify runs) a GPU decode 
    zero-run + Huffman) and take the quantised symbols directly from device memory (no host zigzag, no H2D).
 
 Probe programs used for the diagnosis are in `analysis/mgardx_hip_probe/`.
+
+## Addendum, 12:05: device-resident MGARD-X stages (job 5951454, MI250X frontier00119, warm-up excluded)
+
+Residual codec varied, base codec fixed `huffman|zstd:3`, p4 pressure step 0, REL_L2 1e-3, 16 host threads.
+`verify` = decode-and-compare after the device encode (now opt-in, `HPMGARD_XHUFF_VERIFY=1`).
+CSV: `documents/gpu/mi250x_xdev_2026-11-19.csv`.
+
+| residual codec | device | bytes | CR | compress s | code stage s | decompress s (cpu) |
+|---|---|---|---|---|---|---|
+| huffman\|zstd:3 (in-house, host) | hip | 129,189 | 2048 | 0.179 | 0.114 | 0.331 |
+| raw\|zstd:3 | hip | 157,566 | 1680 | 0.099 | 0.037 | 0.146 |
+| xhuff (GPU Huffman), no verify | hip | 8,197,060 | 32 | 0.091 | 0.028 | 0.351 |
+| xhuff\|zstd:3 (GPU Huffman + host zstd), no verify | hip | 438,348 | 604 | 0.097 | 0.035 | 0.334 |
+| xhuff\|zstd:3, with verify | hip | 438,348 | 604 | 0.208 | 0.143 | 0.334 |
+| xhuff:3 (zstd inside MGARD-X), with verify | hip | 438,186 | 604 | 0.211 | 0.146 | 0.323 |
+| xrle (ZeroRLE_Rans), no verify | hip | 7,567,201 | 35 | 0.075 | 0.012 | 0.593 |
+| xrle\|zstd:3 | hip | 3,252,661 | 81 | 0.120 | 0.056 | 0.597 |
+| xrans (SymbolRans), no verify | hip | 6,669,007 | 40 | 0.075 | 0.011 | 0.524 |
+| xrans\|zstd:3 | hip | 2,331,402 | 114 | 0.107 | 0.044 | 0.523 |
+| xhuff (SERIAL MGARD-X) | cpu | 8,197,060 | 32 | 0.625 | 0.532 | 0.163 |
+| xrle / xrans (SERIAL MGARD-X) | cpu | 7.6 MB / 6.7 MB | 35 / 40 | 0.87 / 0.90 | 0.78 / 0.81 | 0.40 / 0.36 |
+
+Other tolerances on hip: 1e-2 `huffman|zstd:3` 37,914 B vs `xhuff|zstd:3` 147,759 B (code 0.109 vs 0.120 s with
+verify); 1e-4 376,163 B vs 1,008,849 B (0.124 vs 0.118 s with verify). All runs met the bound exactly.
+
+What changed versus the morning numbers: the GPU Huffman stage now codes the device-resident symbols
+(no host zigzag, no 132 MB host-to-device copy, persistent workspace, warm-up excluded), and its real cost
+is 28 ms for 33M symbols; with the host zstd behind it the code stage takes 35 ms against 114 ms for the
+in-house Huffman + zstd, and the whole GPU compress drops from 0.179 s to 0.097 s. The decode-and-compare
+check cost 0.11 s and dominated the earlier measurements; it is therefore off by default and the device
+preflight (`mgardx::DeviceWorks`) is the guard.
+
+Size: on this step-0 field the MGARD-X Huffman stream stays 3.4x larger after zstd (438 KB vs 129 KB)
+because MGARD-X packs 20480-symbol chunks with per-chunk padding, which breaks the byte-exact repetition
+of the 32 identical z-layers that zstd otherwise matches; `raw|zstd:3` (158 KB) shows how much of this
+field's redundancy is that repetition rather than low symbol entropy (the Huffman streams carry about 2
+bits per symbol). The rANS types without zstd land at CR 35-40 like plain Huffman and their CPU decode is
+slower; they remain available as options. Whether the size gap persists on a developed-flow field, which
+has no exact layer repetition, must be measured on such data before the GPU default is chosen.
