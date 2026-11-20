@@ -184,3 +184,44 @@ repetition-heavy fields, never `xhuff|zstd:3`, which is why the auto default doe
 time, hpMGARD including its tuning pass (about 0.47 s of each run) is 2x to 5x faster than MGARD-X HIP on the
 same GPU; with a fixed configuration (`p4_Pressure_inhouse_*`: 0.16 to 0.18 s) it is about 10x faster.
 hpMGARD GPU decode takes 0.1 to 0.7 s depending on the chosen base split. Caveat as before: step-0 data.
+
+## Addendum, 2026-11-20 00:05: gate v2 on an MI250X: fixed `xhuff|zstd:3` vs fixed `huffman|zstd:3` vs tuned, MGARD-X s=inf and s=0 (job 5954583, frontier00187)
+
+Data: `ho_dg_p4_sol` step 0 (Density, Pressure, Rho_ms, P_ms, 3-component Velocity) and `ho_dg_p5_8np_sol`
+pressure (8 blocks); the six Reynolds-stress fields are constant at this step and are left out. Every row
+ran on the GPU with warm-up, 16 host threads, decode on the GPU, MGARD-X HIP 1-D at the same absolute bound.
+Geometric means over the six fields; throughput = raw bytes / compress time.
+CSV: `documents/gpu/mi250x_gate2_2026-11-19.csv`; script `scripts/gate_hip2_compute.sbatch`.
+
+| tol | hpMGARD variant | geomean CR | CR vs MGARD-X s=inf | CR vs MGARD-X s=0 | compress s | GB/s | GPU decode s | MGARD-X HIP compress s |
+|---|---|---|---|---|---|---|---|---|
+| 1e-2 | xhuff\|zstd:3 | 1706 | 7.1x | 5.3x | 0.126 | 3.22 | 0.270 | 1.99 |
+| 1e-2 | huffman\|zstd:3 | 5023 | 20.8x | 15.5x | 0.246 | 1.59 | 0.426 | 2.06 |
+| 1e-2 | tuned | 5070 | 21.0x | 15.7x | 0.846 | 0.45 | 0.355 | 2.06 |
+| 1e-3 | xhuff\|zstd:3 | 550 | 4.2x | 3.5x | 0.169 | 2.90 | 0.342 | 2.02 |
+| 1e-3 | huffman\|zstd:3 | 1577 | 12.1x | 9.9x | 0.255 | 1.54 | 0.461 | 2.09 |
+| 1e-3 | tuned | 1466 | 11.2x | 9.2x | 0.825 | 0.46 | 0.307 | 2.07 |
+| 1e-4 | xhuff\|zstd:3 | 231 | 6.6x | 5.9x | 0.171 | 2.93 | 0.303 | 2.17 |
+| 1e-4 | huffman\|zstd:3 | 554 | 15.9x | 14.0x | 0.273 | 1.45 | 0.510 | 2.25 |
+| 1e-4 | tuned | 825 | 23.6x | 20.9x | 0.982 | 0.37 | 0.461 | 2.24 |
+
+Reading:
+- Throughput: the GPU `xhuff|zstd:3` path compresses the p4 scalars at 3.0 to 3.2 GB/s (0.083 to 0.089 s per
+  265 MB field) and the 8-block p5 pressure at 3.8 to 4.0 GB/s; the in-house chain on the same GPU reaches
+  1.5 to 1.6 GB/s, MGARD-X HIP 0.13 to 0.17 GB/s. The tuner adds about 0.47 s (0.35 to 0.56 GB/s overall).
+- Ratio: on this field set `xhuff|zstd:3` is 2.8 to 3.5x larger than the in-house chain (the layer-repetition
+  effect) but still 4.2x to 7.1x smaller than MGARD-X s=inf. The velocity rows at 1e-3 and 1e-4 fell back to
+  the in-house Huffman for one component because its alphabet exceeded the 8192-entry dictionary cap
+  (compress 0.54 s instead of about 0.25 s); the cap is now 65536 so the GPU path stays on the device. On the
+  CPU build that component codes to 1.20 MB with MGARD-X Huffman versus 0.43 MB with the in-house coder.
+- L2 comparison: MGARD-X s=0 at the same nominal tolerance reaches an RMSE close to hpMGARD's (pressure 1e-3:
+  24.6 vs 24.5; velocity 0.0299 vs 0.0322; density 0.000178 vs 0.000308) while exceeding the pointwise bound
+  by 1.45 to 1.72x; its CR is only 1.1 to 1.4x above s=inf. At that roughly equal RMS error hpMGARD's CR is
+  3.5x to 5.9x higher with `xhuff|zstd:3` and 9.9x to 15.5x higher with the in-house chain, with the
+  pointwise bound still met. A strictly equal-RMSE comparison would need hpMGARD's tolerance scaled per
+  field; the RMSE columns in the CSV allow that.
+- Dedup geometry cache: pressure with the dedup base, cold 1.010 s (geometry 0.527 s) vs warm 0.103 s.
+- zstd workers: no effect on the Huffman chains (their zstd input is 8 MB and takes about 10 ms) and a 1.4%
+  size cost from independent jobs, so multithreading now starts at 16 MB inputs, where it matters: the
+  tuner's `raw|zstd:3` configuration codes its 132 MB stream in 0.034 s with 8 workers against 0.10 s before.
+- All hpMGARD runs met the bound (max err / tol = 1.000; 0.500 where the tuner chose an unsplit base).
