@@ -245,18 +245,78 @@ wired (`HPMGARD_ENABLE_CUDA`) but has not been compiled or run: Frontier has no 
 
 ## 6. Operator (`CompressHpMGARDOperator` repo, `src/`)
 
+### 6.0 Component map (as built, 2026-11-20)
+
 ```
-src/operator/CompressHpMGARDOperator.{h,cpp}  PluginOperatorInterface: Operate, InverseOperate, IsDataTypeValid, GetEstimatedSize, AddExtraParameters; OperatorCreate/Destroy
-src/operator/Params.{h,cpp}                   parameter parsing, HPMGARD_* env overrides, validation, defaults
-src/operator/Header.{h,cpp}                   header + stream directory (de)serialisation, CRC32, versions (section 7)
-src/operator/MeshAdapter.{h,cpp}              cell_grid conn/points via ADIOS2, block selection, cache, corner permutations per shape, host Hilbert/dedup geometry
-src/operator/Tuner.{h,cpp}                    section 3
-src/operator/Backend.{h,cpp}                  backend selection and dispatch (cpu|hip|cuda|auto)
-src/core/      ported mp-MGARD core (mesh types, config, engine, operator tables, kernels, dedup, field stats, error model)
-src/codec/     frbp_{cpu,gpu}.*, lossless wrappers (MGARD-X Huffman+zstd, libzstd)
-compat/cuda/   mp-MGARD's hip→cuda shim
-CMakeLists.txt options ENABLE_HIP / ENABLE_CUDA (exclusive, both off = CPU only), ADIOS2 ≥ 2.10, MGARD-X optional, zstd, OpenMP
-runconf_cpu  runconf_hip  runconf_cuda
+                         ADIOS2 application / bpls / drivers (HpMGARD-Tools)
+                                             |
+            Params ("cell_type", "order", "tolerance", "mode", "tuning", "device", codecs, mesh names, ...)
+            HPMGARD_<NAME> env overrides                     |
+   ==========================================================|=============================================
+   src/operator/  (ADIOS2 PluginOperatorInterface, one shared library)
+     CompressHpMGARDOperator.{h,cpp}   Operate() / InverseOperate() / GetEstimatedSize() / OperatorCreate|Destroy
+     MeshAdapter.{h,cpp}               cell_grid connectivity + points of one block -> MeshCorners (corner permutation)
+   ==========================================================|=============================================
+   src/hpmgard/  (library `hpmgard`, device independent API)  |
+                                                              v
+   CONFIGURATION          Types.h      CompressConfig {shape, p, ncomp, node_set, norm, tolerance | abs_tolerance[],
+                                        base_order, base_rep, base_method, base_quantum_ratio, base/residual codec
+                                        ("auto" | chain spec), tune, tune_sample, tune_codecs, direct_mgardx,
+                                        device ("auto"|cpu|hip|cuda), threads, verbose}
+                                       FieldView {data, ncells, nsp, ncomp}   MeshCorners   BlockMeta {blockid, dims, ...}
+                                                              |
+   INITIALISATION         Backend.h    MakeBackend(device) -> CPU backend (OpenMP) | GPU backend (process-wide instance:
+                                        device buffers, pinned host scratch, cached operator upload) via DeviceShim.h
+                          Operators.h  BuildOperators(shape, p, p_base, node_set, rep): RE1/Pc1 (1-D, tensor shapes)
+                                        or Rfull/Pfull (dense, ported simplex tables)      [cheap, per call]
+                          BaseSplit.h  CachedDedupGeometry(mesh): Hilbert order + vertex groups, LRU per mesh fingerprint
+                          MgardX.h     DeviceWorks(device) preflight (gates MGARD-X stages and the direct candidate)
+                          codec        WarmupStage(): MGARD-X kernels + workspace once per process and type
+                                                              |
+   COMPRESSION   Compressor.h  Compress(field, cfg, mesh, meta) -> {bytes, CompressStats}
+     |  Tuner.h   Tune(): sample chunks -> candidates {base order 0/1/2/p} x {cellavg, dedup} x base quantum
+     |            x codec list (+ mgardx base, direct MGARD-X) -> smallest -> resolved CompressConfig
+     |  ComputeStats(field) -> per-component scale (RMS / range) -> absolute tolerance tol_c
+     |  per component c:                                                     backend stage
+     |    Session(u)        upload component once (pinned)                   GPU: BeginComponent
+     |    base = R u        Restrict                                          CPU sweeps | GPU Tensor3Kernel / dense
+     |    split             CellAvg: means (CellMeans) + remainder | DedupSfc: per-vertex mean + Hilbert remainder
+     |    quantise          q_base = 2*ratio*tol  -> symbols -> codec chain (host symbols)
+     |    base_dec          decoded base (closed loop)
+     |    k = rint((u - P base_dec)/q_res)   ResidualFromBase (fused prolong+quantise; symbols stay on the GPU)
+     |    code              EncodeSymbolsDevice / EncodeSymbols:  stage 0  raw | frbp | huffman | xhuff | xrle | xrans
+     |                                                           stage 1+ zstd[:L] (multithreaded >= 16 MB)
+     |  Header.h  SerializeHeader(): magic, versions, CRC32, config, per-component scales/tolerances/quanta,
+     |            codec strings, mesh identity (groups, CRCs), stream directory      -> bytes
+     v
+   DECOMPRESSION  Compressor.h  Decompress(bytes, mesh, out, header_out, device)
+        ParseHeader() -> rebuild config; MakeBackend(device); BuildOperators(from header); CachedDedupGeometry (CRC check)
+        per component: Const | RawDoubles | Direct(MGARD-X) ...  or
+          base streams -> DecodeSymbols -> base_dec (avg + remainder, cellavg or dedup scatter)
+          residual   -> DecodeSymbolsToDevice (GPU: MGARD-X decode, symbols stay on the device)
+                        ReconstructFromDeviceSymbols: out = P base_dec + k q_res   (host fallback: DecodeSymbols + ReconstructFromBase)
+   ==========================================================================================================
+   codec/   Codec.h (chain parse/container), RawFrbpZstd.cpp, Huffman.cpp, Pipeline.cpp,
+            MgardXHuff.{h,cpp} + MgardXHuffImpl.hpp + _SERIAL.cpp (OpenMP-free target) + MgardXHuffDevice.inc (-> _HIP.hip, _CUDA.cu)
+   ported/  mp-MGARD tables and Hilbert code (rp_operators, tet/prism/pyramid tables, gauss/gll/tri quadrature, sfc)
+   DeviceShim.h  HIP runtime names -> CUDA (BackendDevice.inc -> BackendHIP.hip / BackendCUDA.cu)
+```
+
+Data flow of the compressed block: `[preamble: type byte 54, software + file version, size, CRC32]
+[header: config, per-component tolerances/quanta, codec chains, mesh identity, stream directory] [streams]`.
+Decompression needs nothing but the block (and the mesh for dedup blocks, located through the header's
+variable names or explicit parameters).
+
+### 6.1 Repository layout (as built)
+
+```
+src/operator/CompressHpMGARDOperator.{h,cpp}  PluginOperatorInterface: Operate, InverseOperate, IsDataTypeValid, GetEstimatedSize, AddExtraParameters; OperatorCreate/Destroy; Params + HPMGARD_* env; ResolveMeshSource
+src/operator/MeshAdapter.{h,cpp}              cell_grid conn/points via ADIOS2, block selection, one-block cache, corner permutation
+src/hpmgard/Types.h Compressor.{h,cpp} Tuner.{h,cpp} Header.{h,cpp} Operators.{h,cpp} Quadrature.{h,cpp} BaseSplit.{h,cpp} MgardX.{h,cpp} Bytes.h
+src/hpmgard/Backend.h BackendCPU.cpp DeviceShim.h BackendDevice.inc BackendHIP.hip BackendCUDA.cu
+src/hpmgard/codec/   Codec.h Pipeline.cpp RawFrbpZstd.cpp Huffman.cpp MgardXHuff.{h,cpp} MgardXHuffImpl.hpp MgardXHuff_SERIAL.cpp MgardXHuffDevice.inc MgardXHuff_HIP.hip MgardXHuff_CUDA.cu
+src/hpmgard/ported/  mp-MGARD tables (PROVENANCE.md)
+CMakeLists.txt options HPMGARD_ENABLE_HIP / HPMGARD_ENABLE_CUDA / HPMGARD_ENABLE_MGARDX / HPMGARD_BUILD_ADIOS2_PLUGIN; runconf_cpu, runconf_hip
 ```
 
 **Operate:** parse/validate params → derive nsp, ncomp → below `threshold`: raw → `CellBatch` view → mesh
@@ -269,7 +329,7 @@ configuration and stream views → mesh if DEDUP (`ResolveMeshSource`: explicit
 `EngineName` with the names embedded in the header; verify geometry CRCs) → backend `auto` → decode
 streams, dequantise, reconstruct → `dataOut`.
 
-### 6.1 Parameters (ADIOS2 `Params`; `HPMGARD_<NAME>` env overrides the runtime knobs)
+### 6.2 Parameters (ADIOS2 `Params`; `HPMGARD_<NAME>` env overrides the runtime knobs)
 
 | name | required | default | meaning |
 |---|---|---|---|
@@ -358,6 +418,19 @@ Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 
   device-resident data across stages, tensor-sweep kernels, GPU FRBP/Huffman with the byte-identity test,
   MGARD-X HIP device type, CUDA via the compat shim.
 - Not done: CUDA run on NVIDIA hardware (wired, uncompiled), simplex verification. Dropped by decision (2026-11-19): MPI in the drivers (operator is used from ADIOS2 inside the application's ranks), parallel in-house Huffman (MGARD-X's GPU Huffman is the GPU coder; zstd is multithreaded instead).
+
+## 8.2 Requirements review against `plan.md` (2026-11-20)
+
+| plan item | status |
+|---|---|
+| 1. New repo linked to gqian-coder/CompressHpMGARDOperator | done; HpMGARD-Tools as the second repo |
+| 2. Port mp-MGARD refactor/compress for the VKI data, keep other shapes | done for compression: HEX/QUAD tensor path verified on VKI p1..p5; TET/PRISM/PYRAMID through the ported dense tables, compiled and unit-tested but unverified on real data; refactoring/retrieval deliberately out of v1 |
+| 3. Same framing as CompressMGARDCentroidOperator, linkable to ADIOS2 as an operator | done: PluginOperatorInterface, `OperatorCreate/Destroy`, params + env, raw fallback, `GetEstimatedSize`; bpls decodes with `ADIOS2_PLUGIN_PATH` |
+| 4a. Compiled and portable across AMD and NVIDIA GPUs | AMD: built and validated (MI250X compute nodes; MI210 login GPU falls back for MGARD-X stages). NVIDIA: the same device sources compile for CUDA through `DeviceShim.h` and `HPMGARD_ENABLE_CUDA`, but no NVIDIA machine was available, so the CUDA build is untested |
+| 4b. Data compressed on NVIDIA decodes on AMD and vice versa | by construction and tested across CPU and HIP: the symbol streams, the MGARD-X Huffman/SymbolRans streams and the header are device independent; GPU decode equals CPU decode bit for bit for symbol streams (85-check suite on MI250X); `xrle` streams differ in bytes between devices but decode everywhere; MGARD-X double streams (`mgardx` base codec, direct mode) decode within the bound on every device. The AMD-NVIDIA pair itself awaits a CUDA machine |
+| 4c. All configuration stored with the data; decompression self-configuring | done: header carries shape, order, node set, base order/method, codecs, per-component scales/tolerances/quanta, mesh identity (groups + CRCs) and the stream directory; `Decompress` needs only the block (plus the mesh for dedup blocks, found via the header's variable names) |
+| 4d. CPU-only compressor and decompressor (decision 5) | done; CPU and GPU decode each other's output |
+| Must-achieve: more efficient than MGARD-X in ratio and speed | met on the VKI step-0 data: GPU gate 4.2x to 24x the ratio of MGARD-X s=inf at equal bound (3.5x to 21x vs s=0 at comparable RMSE), 10x to 20x the throughput (section 4 and the GPU memo); to be re-measured on a developed-flow field |
 
 ## 9. Milestones and functionality checklist
 
