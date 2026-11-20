@@ -88,8 +88,10 @@ int main() {
             std::vector<double> out_dev; Decompress(r.bytes.data(), r.bytes.size(), k.mesh ? &s.mesh : nullptr, out_dev, nullptr, dev);
             // symbol streams reconstruct identically on every backend; MGARD-X double streams (base codec mgardx,
             // direct) are decoded by MGARD-X's own SERIAL vs GPU inverse transforms, which differ in rounding
-            if (k.cfg.base_codec == "mgardx" || k.cfg.direct_mgardx) CHECK(MaxErr(out_dev, s.data) <= tol_abs * (1 + 1e-9));
-            else CHECK(out_dev == out);
+            // the GPU reconstructs with dense per-cell matrices, the CPU with tensor sweeps: identical symbols, rounding-level
+            // differences in the prolonged base (the bound holds on both); MGARD-X double streams differ by their own transforms
+            CHECK(MaxErr(out_dev, s.data) <= tol_abs * (1 + 1e-9));
+            if (!(k.cfg.base_codec == "mgardx" || k.cfg.direct_mgardx)) { const double dd = MaxErr(out_dev, out); CHECK(dd <= 1e-9 * tol_abs); if (dd > 0) std::printf("    (gpu vs cpu decode max diff %.2e)\n", dd); }
         }
         CHECK(h.blockid == 7 && h.p == 4 && h.nsp == 125 && h.ncomp == 1);
         std::printf("  %-38s CR %7.2f  max err %.3e / tol %.3e  (%s)\n", k.name, r.stats.ratio(), err, tol_abs, r.stats.used.direct_mgardx ? "direct" : (r.stats.used.base_method == BaseMethod::DedupSfc ? "dedup" : "cellavg/plain"));

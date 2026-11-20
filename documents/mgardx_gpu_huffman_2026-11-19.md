@@ -266,3 +266,38 @@ What the device base path changed (p4 pressure 1e-3, xhuff): compress 0.087 -> 0
 0.075 s (block 4096 included), base stage 0.025 -> 0.016 s, residual 0.003 -> 0.002 s. Velocity went from
 0.772 s (with the 65536 dictionary that made MGARD-X's codebook construction slow) to 0.294 s with the 8192
 dictionary plus outliers. The dedup split on the GPU gives the same streams as the CPU on these fields.
+
+## Addendum, 2026-11-20 02:00: fused GPU path and GPU FRBP (job 5955128, MI250X frontier00093)
+
+Changes (operator 81ceb47, 662e7bf): statistics on the device after the single upload; one fused kernel per cell
+batch for restriction, base split (plain, cell average, dedup), quantisation, decoded base, prolongation and
+residual quantisation, with one overflow-flag read per component; FRBP stage on the GPU (byte-identical to the
+CPU format, verified: the `frbp|zstd:3` stream of the pressure field is 304,247 bytes from both backends and
+the dedup variant 453,843 bytes from both); zstd of each stream on a worker thread while the device codes the
+next one; fused reconstruction on decompression from device-decoded streams; memoised operators. No tuning,
+warm-up excluded, 16 host threads, decode on the GPU unless noted. CSV: `documents/gpu/mi250x_fused_2026-11-20.csv`.
+
+| case | bytes | CR | compress s | GB/s | decompress s | GB/s |
+|---|---|---|---|---|---|---|
+| p4 pressure 1e-3, frbp\|zstd:3 | 304,247 | 870 | 0.035 | 7.6 | 0.034 | 7.8 |
+| p4 pressure 1e-3, frbp (no zstd) | 6,572,219 | 40 | 0.032 | 8.3 | 0.032 | 8.3 |
+| p4 pressure 1e-3, xhuff\|zstd:3 | 455,262 | 581 | 0.047 | 5.6 | 0.065 | 4.1 |
+| p4 pressure 1e-3, huffman\|zstd:3 (host coder) | 129,189 | 2048 | 0.131 | 2.0 | 0.224 | 1.2 |
+| p4 pressure 1e-3, CPU, huffman\|zstd:3 | 129,189 | 2048 | 0.355 | 0.75 | 0.394 | 0.67 |
+| p4 pressure 1e-3, frbp\|zstd:3, decode on CPU | 304,247 | 870 | 0.035 | 7.6 | 0.183 | 1.5 |
+| p4 pressure 1e-2 / 1e-4, frbp\|zstd:3 | 67,698 / 884,329 | 3909 / 299 | 0.031 / 0.042 | 8.5 / 6.3 | 0.032 / 0.035 | 8.3 / 7.6 |
+| p4 pressure 1e-3, dedup base, frbp\|zstd:3 | 453,843 | 583 | 0.048 | 5.5 | 0.045 | 5.9 |
+| p4 velocity (794 MB) 1e-3, frbp\|zstd:3 | 3,072,866 | 258 | 0.131 | 6.1 | 0.390 | 2.0 |
+| p5 pressure (457 MB, 8 blocks) 1e-3, frbp\|zstd:3 | 193,412 | 2364 | 0.056 | 8.2 | 0.056 | 8.2 |
+| p4 pressure 1e-3, tuned (list incl. frbp) | 218,949 (raw\|zstd:3) | 1209 | 0.494 (0.45 tuning) | | 0.216 | |
+
+Breakdown of the 0.035 s (pressure 1e-3, frbp|zstd:3): statistics 0.2 ms, fused kernel 3 ms, FRBP + stream copy
+3 ms, and about 28 ms of host-side data movement: the 265 MB memcpy that extracts the component into pinned
+memory (about 10 ms), the upload (6 to 8 ms), the zstd of the residual stream (about 8 ms, overlapped only
+with later streams) and the header. Compared with the morning's 0.318 s this is 9x; the paper's 100 GB/s is
+device-to-device with fixed-rate coding and no host stages, so the remaining factor is almost entirely the
+host boundary (the GPU work is now about 6 ms per field).
+
+Codec picture on this field: GPU FRBP + zstd is smaller than MGARD-X Huffman + zstd here (304 vs 455 KB) and
+faster (both directions 8 GB/s class); the in-house Huffman + zstd stays the smallest (129 KB) at a quarter of
+the throughput. The GPU tuner list now includes `frbp|zstd:3`; the auto default stays `xhuff|zstd:3`.
