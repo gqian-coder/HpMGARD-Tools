@@ -310,7 +310,7 @@ explicit version numbers on anything newer. About 300 bytes per block.
 HpMGARD-Tools/
   CMakeLists.txt  build_scripts_{cpu,hip,cuda}.sh   builds against installed ADIOS2 + CompressHpMGARDOperator (+ MGARD-X)
   README.md  documents/                             format review, this design, bitstream.md, benchmark memos
-  hpmgard_adios_compress.cpp                        MPI driver: cell_grid BP in, compressed BP out, passthrough of everything else, per-variable params from the file's attributes, blockid per Put, tune-once-per-variable, byte/time logs
+  hpmgard_adios_compress.cpp                        serial file driver (the operator itself runs inside the application's ADIOS2/MPI ranks, so no MPI driver is planned): cell_grid BP in, compressed BP out, passthrough of everything else, per-variable params from the file's attributes, blockid per Put, tune-once-per-variable, byte/time logs
   hpmgard_adios_decompress.cpp                      compressed BP → decompressed BP
   hpmgard_verify.cpp                                original vs decompressed: max / RMSE / relative per variable and block
   hpmgard_meta_dump.cpp                             prints a block's header and directory
@@ -357,7 +357,7 @@ Both repositories exist and are pushed. Built and passing on Frontier (CPU, CCE 
   cross-backend directions. Resume at:
   device-resident data across stages, tensor-sweep kernels, GPU FRBP/Huffman with the byte-identity test,
   MGARD-X HIP device type, CUDA via the compat shim.
-- Not done: CUDA/cross-backend matrix (M5), MPI in the drivers, simplex verification, parallel Huffman/zstd.
+- Not done: CUDA run on NVIDIA hardware (wired, uncompiled), simplex verification. Dropped by decision (2026-11-19): MPI in the drivers (operator is used from ADIOS2 inside the application's ranks), parallel in-house Huffman (MGARD-X's GPU Huffman is the GPU coder; zstd is multithreaded instead).
 
 ## 9. Milestones and functionality checklist
 

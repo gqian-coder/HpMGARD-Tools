@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
     if (cfg.verbose) std::cerr << r.stats.tune_report << DescribeHeader(h);
 
     // MGARD-X direct reference at the same absolute bound (component 0 scale)
-    double cr_mx_inf = 0, cr_mx_0 = 0, t_mx_inf = 0, t_mx_0 = 0, err_mx_inf = 0, err_mx_0 = 0;
+    double cr_mx_inf = 0, cr_mx_0 = 0, t_mx_inf = 0, t_mx_0 = 0, err_mx_inf = 0, err_mx_0 = 0, sq_mx_inf = 0, sq_mx_0 = 0;
     if (a.count("mgardx-direct") && mgardx::Available()) {
         std::vector<double> comp(ncells * nsp);
         size_t total_inf = 0, total_0 = 0;
@@ -118,25 +118,26 @@ int main(int argc, char** argv) {
                     std::vector<uint8_t> b = mgardx::Compress1D(comp.data(), comp.size(), tol, s, 0, mdev);
                     const double tc = Sec(ta, Clock::now());
                     std::vector<double> d; mgardx::Decompress(b.data(), b.size(), d, mdev);
-                    double me = 0; for (size_t i = 0; i < comp.size(); ++i) me = std::max(me, std::fabs(d[i] - comp[i]));
-                    if (mode == 0) { total_inf += b.size(); t_mx_inf += tc; err_mx_inf = std::max(err_mx_inf, me / tol); }
-                    else { total_0 += b.size(); t_mx_0 += tc; err_mx_0 = std::max(err_mx_0, me / tol); }
+                    double me = 0, sq2 = 0; for (size_t i = 0; i < comp.size(); ++i) { const double e = d[i] - comp[i]; me = std::max(me, std::fabs(e)); sq2 += e * e; }
+                    if (mode == 0) { total_inf += b.size(); t_mx_inf += tc; err_mx_inf = std::max(err_mx_inf, me / tol); sq_mx_inf += sq2; }
+                    else { total_0 += b.size(); t_mx_0 += tc; err_mx_0 = std::max(err_mx_0, me / tol); sq_mx_0 += sq2; }
                 } catch (const std::exception& e) { std::cerr << "MGARD-X reference failed (device " << mdev << ", s=" << s << "): " << e.what() << "\n"; }
             }
         }
         cr_mx_inf = total_inf ? double(r.stats.raw_bytes) / total_inf : 0; cr_mx_0 = total_0 ? double(r.stats.raw_bytes) / total_0 : 0;
     }
+    const double rmse_mx_inf = std::sqrt(sq_mx_inf / out.size()), rmse_mx_0 = std::sqrt(sq_mx_0 / out.size());
     const std::string label = get("label", a["raw"]);
     const bool header = !a.count("csv") || !std::ifstream(a["csv"]).good();
     FILE* out_f = a.count("csv") ? std::fopen(a["csv"].c_str(), "a") : stdout;
-    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0,device,t_stats,t_refactor,t_base,t_residual,t_code\n");
+    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0,device,t_stats,t_refactor,t_base,t_residual,t_code,mgardx_rmse_sinf,mgardx_rmse_s0,t_geom\n");
     const CompressConfig& u = r.stats.used;
-    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.6g,%.6g,%.3f\n",
                  label.c_str(), ncells, cfg.p, cfg.ncomp, norm.c_str(), cfg.tolerance, h.tol_abs[0],
                  (unsigned long long)r.stats.raw_bytes, (unsigned long long)r.stats.compressed_bytes, r.stats.ratio(), maxrel, rmse, t_comp, t_dec, r.stats.t_tune,
                  u.base_order, u.base_method == BaseMethod::DedupSfc ? "dedup" : u.base_method == BaseMethod::CellAvg ? "cellavg" : "plain", u.base_quantum_ratio,
                  u.base_codec.c_str(), u.residual_codec.c_str(), u.direct_mgardx ? 1 : 0, cr_mx_inf, err_mx_inf, t_mx_inf, cr_mx_0, err_mx_0, t_mx_0,
-                 h.writer.c_str(), r.stats.t_stats, r.stats.t_refactor, r.stats.t_base, r.stats.t_residual, r.stats.t_code);
+                 h.writer.c_str(), r.stats.t_stats, r.stats.t_refactor, r.stats.t_base, r.stats.t_residual, r.stats.t_code, rmse_mx_inf, rmse_mx_0, r.stats.t_geom);
     if (out_f != stdout) std::fclose(out_f);
     if (maxrel > 1.0 + 1e-9) { std::cerr << "ERROR: bound violated (max err / tol = " << maxrel << ")\n"; return 4; }
     return 0;
