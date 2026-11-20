@@ -225,3 +225,44 @@ Reading:
   size cost from independent jobs, so multithreading now starts at 16 MB inputs, where it matters: the
   tuner's `raw|zstd:3` configuration codes its 132 MB stream in 0.034 s with 8 workers against 0.10 s before.
 - All hpMGARD runs met the bound (max err / tol = 1.000; 0.500 where the tuner chose an unsplit base).
+
+## Addendum, 2026-11-20 01:10: device-resident base path, block 4096, outliers (job 5955003, MI250X frontier00040)
+
+Changes: restriction, base split (cell average, dedup, plain), base quantisation and the decoded base now run
+on the device and the base streams are coded from device memory (operator f7560f6); the MGARD-X dictionary
+cap is back to 8192 with up to 1% out-of-dictionary codes stored as MGARD-X outliers instead of a host
+fallback, and the Huffman block defaults to 4096 (204febc). No tuning in any row; warm-up excluded; 16 host
+threads; decode on the same device. CSV: `documents/gpu/mi250x_devbase_2026-11-20.csv`.
+
+| case (fixed chain) | bytes | CR | compress s | GB/s | decode s | decode GB/s | stats | base | residual | code |
+|---|---|---|---|---|---|---|---|---|---|---|
+| p4 pressure 1e-2, hip xhuff\|zstd:3 | 136,535 | 1938 | 0.057 | 4.6 | 0.066 | 4.0 | 0.006 | 0.014 | 0.002 | 0.015 |
+| p4 pressure 1e-3, hip xhuff\|zstd:3 | 455,262 | 581 | 0.065 | 4.1 | 0.075 | 3.5 | 0.005 | 0.016 | 0.002 | 0.023 |
+| p4 pressure 1e-4, hip xhuff\|zstd:3 | 1,149,209 | 230 | 0.076 | 3.5 | 0.075 | 3.5 | 0.005 | 0.017 | 0.002 | 0.034 |
+| p4 pressure 1e-3, hip huffman\|zstd:3 | 129,189 | 2048 | 0.158 | 1.7 | 0.255 | 1.0 | 0.005 | 0.018 | 0.007 | 0.112 |
+| p4 pressure 1e-3, cpu huffman\|zstd:3 | 129,189 | 2048 | 0.372 | 0.7 | 0.398 | 0.7 | 0.006 | 0.024 | 0.107 | 0.118 |
+| p4 pressure 1e-3, hip dedup base, xhuff\|zstd:3 | 559,933 | 473 | 0.080 | 3.3 | 0.085 | 3.1 | 0.007 | 0.018 | 0.002 | 0.026 |
+| p4 velocity (3 comp, 794 MB) 1e-3, hip xhuff\|zstd:3 | 4,142,576 | 192 | 0.294 | 2.7 | 0.531 | 1.5 | 0.047 | 0.060 | 0.006 | 0.139 |
+| p4 velocity 1e-3, hip huffman\|zstd:3 | 1,778,670 | 446 | 0.552 | 1.4 | 0.899 | 0.9 | 0.056 | 0.058 | 0.021 | 0.372 |
+| p5 pressure (8 blocks, 457 MB) 1e-3, hip xhuff\|zstd:3 | 608,231 | 752 | 0.105 | 4.4 | 0.101 | 4.5 | 0.011 | 0.021 | 0.003 | 0.033 |
+
+The restriction column is zero because the device path launches it asynchronously and its time lands in the
+base stage; the difference between the stage sum and the total (about 0.02 s for a scalar field) is the
+component upload (265 MB pinned, 6 to 8 ms), the symbol-stream copies to the host and launch/sync latencies.
+
+Block size (`HPMGARD_XHUFF_BLOCK`), p4 pressure 1e-3, hip compress + hip decode:
+
+| block | bytes | compress s | decode s |
+|---|---|---|---|
+| 1024 | 504,547 | 0.064 | 0.055 |
+| 4096 (new default) | 455,262 | 0.064 | 0.075 |
+| 20480 (MGARD-X's previous setting) | 418,749 | 0.076 | 0.184 |
+
+Velocity: 4.20 / 4.14 / 3.94 MB and decode 0.47 / 0.52 / 0.85 s for 1024 / 4096 / 20480. MGARD-X's decoder
+runs one thread per block, so 33M symbols give only 1.6k threads at 20480 and 8k at 4096; the encoder also
+gains a little from the smaller blocks.
+
+What the device base path changed (p4 pressure 1e-3, xhuff): compress 0.087 -> 0.065 s, decode 0.183 ->
+0.075 s (block 4096 included), base stage 0.025 -> 0.016 s, residual 0.003 -> 0.002 s. Velocity went from
+0.772 s (with the 65536 dictionary that made MGARD-X's codebook construction slow) to 0.294 s with the 8192
+dictionary plus outliers. The dedup split on the GPU gives the same streams as the CPU on these fields.
