@@ -236,6 +236,19 @@ component, residual symbols, base, decoded base and output) and the uploaded ope
 so repeated blocks pay no allocation or pinning. `MakeBackend` returns a proxy to that instance. The
 backends are not thread safe (one compressor per process, as in the ADIOS2 plugin).
 
+Host boundary (block-resident path, 2026-11-20). The caller's interleaved block is never copied on the
+host: `BeginBlockComponent` uploads it once per `Compress` call through two 32 MB pinned staging buffers on
+two streams, an OpenMP memcpy into one buffer overlapping the link transfer of the other
+(`UploadPipelined`); the statistics kernel and the fused kernel read component c with stride ncomp, so a
+multi-component variable is de-interleaved by the kernels, not by a host loop. On decompression every
+component is reconstructed interleaved into one device block (`ReconstructFusedToBlock`) and
+`DownloadBlock` copies it once, chunked and pipelined, straight into the caller's buffer (`DecompressInto`;
+the ADIOS2 operator passes its destination buffer, so there is no intermediate vector, zero fill or second
+copy). Host extraction (`ExtractComponent`) remains only for the fallbacks that need a host component
+(constant, raw doubles, MGARD-X direct, quantiser overflow) and for the CPU backend. The two link copies
+are now the whole host cost of a GPU call; the upload runs at the staging memcpy or link rate, whichever
+is lower, and would disappear only if ADIOS2 handed the operator a device buffer.
+
 Rules: residuals are floating point, so different backends may emit different (both valid) streams for
 the same input; every backend must decode every valid stream within the bound (the HIP tensor-sweep kernels
 have so far produced byte-identical streams to the CPU on the VKI fields). Permutations are computed on
@@ -276,10 +289,15 @@ wired (`HPMGARD_ENABLE_CUDA`) but has not been compiled or run: Frontier has no 
    COMPRESSION   Compressor.h  Compress(field, cfg, mesh, meta) -> {bytes, CompressStats}
      |  Tuner.h   Tune(): sample chunks -> candidates {base order 0/1/2/p} x {cellavg, dedup} x base quantum
      |            x codec list (+ mgardx base, direct MGARD-X) -> smallest -> resolved CompressConfig
-     |  ComputeStats(field) -> per-component scale (RMS / range) -> absolute tolerance tol_c
      |  per component c:                                                     backend stage
-     |    Session(u)        upload component once (pinned)                   GPU: BeginComponent
-     |    base = R u        Restrict                                          CPU sweeps | GPU Tensor3Kernel / dense
+     |    block residency   GPU fused path: BeginBlockComponent(block, c)     one pipelined upload of the interleaved
+     |                      (no host extraction; kernels read stride ncomp)   block per call (32 MB pinned chunks, 2 streams)
+     |    stats             ComponentStatsResident | ComponentStats(u)       GPU StatsKernel | host OpenMP
+     |                      -> scale (RMS / range) -> absolute tolerance tol_c
+     |    Session(u)        other paths: ExtractComponent + upload (pinned)   GPU: BeginComponent
+     |    fused             FusedCompressResident: restrict, split, quantise, decoded base, prolong, residual
+     |                      in one kernel per cell batch (GPU, tensor shapes)  symbols stay on the device
+     |    base = R u        Restrict (non-fused paths)                        CPU sweeps | GPU Tensor3Kernel / dense
      |    split             CellAvg: means (CellMeans) + remainder | DedupSfc: per-vertex mean + Hilbert remainder
      |    quantise          q_base = 2*ratio*tol  -> symbols -> codec chain (host symbols)
      |    base_dec          decoded base (closed loop)
@@ -289,12 +307,15 @@ wired (`HPMGARD_ENABLE_CUDA`) but has not been compiled or run: Frontier has no 
      |  Header.h  SerializeHeader(): magic, versions, CRC32, config, per-component scales/tolerances/quanta,
      |            codec strings, mesh identity (groups, CRCs), stream directory      -> bytes
      v
-   DECOMPRESSION  Compressor.h  Decompress(bytes, mesh, out, header_out, device)
+   DECOMPRESSION  Compressor.h  DecompressInto(bytes, mesh, double* out, count, header_out, device, DecompressStats*)
+                                Decompress(..., std::vector<double>& out, ...) resizes and forwards
         ParseHeader() -> rebuild config; MakeBackend(device); BuildOperators(from header); CachedDedupGeometry (CRC check)
         per component: Const | RawDoubles | Direct(MGARD-X) ...  or
-          base streams -> DecodeSymbols -> base_dec (avg + remainder, cellavg or dedup scatter)
-          residual   -> DecodeSymbolsToDevice (GPU: MGARD-X decode, symbols stay on the device)
-                        ReconstructFromDeviceSymbols: out = P base_dec + k q_res   (host fallback: DecodeSymbols + ReconstructFromBase)
+          GPU fused: all three streams -> DecodeSymbolsToDevice (FRBP / MGARD-X on the device, zstd on the host)
+                     ReconstructFusedToBlock: dequantise base, prolong, add residual, write interleaved into the device block
+          otherwise: base streams -> DecodeSymbols -> base_dec (avg + remainder, cellavg or dedup scatter)
+                     residual -> DecodeSymbolsToDevice + ReconstructFromDeviceSymbols | DecodeSymbols + ReconstructFromBase
+        DownloadBlock(out): one chunked, pipelined copy into the caller's buffer; host-made components inserted after it
    ==========================================================================================================
    codec/   Codec.h (chain parse/container), RawFrbpZstd.cpp, Huffman.cpp, Pipeline.cpp,
             MgardXHuff.{h,cpp} + MgardXHuffImpl.hpp + _SERIAL.cpp (OpenMP-free target) + MgardXHuffDevice.inc (-> _HIP.hip, _CUDA.cu)
