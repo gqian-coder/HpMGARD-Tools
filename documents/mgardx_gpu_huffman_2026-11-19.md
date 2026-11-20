@@ -142,3 +142,45 @@ to 0.038 s of which about 0.03 s is the host zstd behind MGARD-X's Huffman. GPU 
 in-house chain on this field (419 KB vs 129 KB) is the layer-repetition effect discussed above; on a
 developed-flow field it has to be re-measured before the GPU default is final. MGARD-X HIP Huffman streams
 remain byte-identical to the SERIAL ones; `xrle` streams differ in bytes between devices but decode on both.
+
+## Addendum, 23:10: gate sweep on an MI250X, hpMGARD (GPU, tuned) vs MGARD-X HIP (job 5954493, frontier07079)
+
+Same protocol as the CPU gate of the morning, now entirely on the GPU: hpMGARD tuned with the auto codec list
+(`xhuff|zstd:3,huffman|zstd:3,raw|zstd:3`, dedup geometry from the mesh dumps), device-resident path,
+decode on the GPU; MGARD-X HIP 1-D on the same absolute pointwise bound (s=inf; s=0 shown for reference).
+VKI step 0, p4 all fields and the 8-block p5 pressure. uu, vv, ww, uv, vw and uw are constant at this
+step (one Const stream, CR 1.3e6, error 0) and are excluded from the geometric means below. All hpMGARD
+runs met the bound (max err / tol = 1.000 or 0.500); MGARD-X s=inf lands at 0.74 to 0.80 of the bound.
+CSV: `documents/gpu/mi250x_gate_hip_2026-11-19.csv`; job script `scripts/gate_hip_compute.sbatch`.
+
+1e-2: geomean CR ratio hpMGARD/MGARD-X(s=inf) = 19.5x over 6 non-constant fields; mean compress hpMGARD tuned 0.85 s (incl. tuning) vs MGARD-X HIP 2.04 s; mean hpMGARD GPU decode 0.33 s
+1e-3: geomean CR ratio hpMGARD/MGARD-X(s=inf) = 11.7x over 6 non-constant fields; mean compress hpMGARD tuned 0.85 s (incl. tuning) vs MGARD-X HIP 2.08 s; mean hpMGARD GPU decode 0.30 s
+1e-4: geomean CR ratio hpMGARD/MGARD-X(s=inf) = 24.9x over 6 non-constant fields; mean compress hpMGARD tuned 1.01 s (incl. tuning) vs MGARD-X HIP 2.24 s; mean hpMGARD GPU decode 0.43 s
+
+| field | tol | hpMGARD CR | chosen codecs | MGARD-X s=inf CR | MGARD-X s=0 CR | ratio (s=inf) | hpMGARD compress s (tuned) | MGARD-X HIP s |
+|---|---|---|---|---|---|---|---|---|
+| p4_Density_aver | 1e-2 | 8118 | huffman|zstd:3/huffman|zstd:3 | 250.6 | 350.0 | 32.4 | 0.66 | 1.65 |
+| p4_Pressure_aver | 1e-2 | 6980 | huffman|zstd:3/huffman|zstd:3 | 242.4 | 324.6 | 28.8 | 0.66 | 1.65 |
+| p4_Rho_ms | 1e-2 | 6469 | huffman|zstd:3/huffman|zstd:3 | 209.9 | 288.1 | 30.8 | 0.66 | 1.65 |
+| p4_P_ms | 1e-2 | 2550 | raw|zstd:3/raw|zstd:3 | 202.3 | 270.4 | 12.6 | 0.59 | 1.65 |
+| p4_Velocity_aver | 1e-2 | 1200 | raw|zstd:3/raw|zstd:3 | 149.9 | 192.6 | 8.0 | 1.73 | 1.91 |
+| p5_Pressure_aver | 1e-2 | 9468 | huffman|zstd:3/huffman|zstd:3 | 506.7 | 673.3 | 18.7 | 0.80 | 3.77 |
+| p4_Density_aver | 1e-3 | 2195 | huffman|zstd:3/huffman|zstd:3 | 136.2 | 167.9 | 16.1 | 0.73 | 1.67 |
+| p4_Pressure_aver | 1e-3 | 1702 | raw|zstd:3/raw|zstd:3 | 130.6 | 159.4 | 13.0 | 0.60 | 1.64 |
+| p4_Rho_ms | 1e-3 | 1531 | raw|zstd:3/raw|zstd:3 | 115.4 | 141.3 | 13.3 | 0.60 | 1.68 |
+| p4_P_ms | 1e-3 | 1285 | raw|zstd:3/raw|zstd:3 | 111.2 | 136.2 | 11.6 | 0.61 | 1.66 |
+| p4_Velocity_aver | 1e-3 | 591 | raw|zstd:3/raw|zstd:3 | 77.9 | 96.7 | 7.6 | 1.71 | 2.02 |
+| p5_Pressure_aver | 1e-3 | 2842 | huffman|zstd:3/huffman|zstd:3 | 277.0 | 328.0 | 10.3 | 0.83 | 3.79 |
+| p4_Density_aver | 1e-4 | 1045 | raw|zstd:3/raw|zstd:3 | 34.0 | 37.4 | 30.8 | 0.83 | 1.81 |
+| p4_Pressure_aver | 1e-4 | 1024 | raw|zstd:3/raw|zstd:3 | 33.8 | 36.7 | 30.3 | 0.84 | 1.80 |
+| p4_Rho_ms | 1e-4 | 946 | raw|zstd:3/raw|zstd:3 | 30.3 | 34.9 | 31.2 | 0.82 | 1.82 |
+| p4_P_ms | 1e-4 | 745 | raw|zstd:3/raw|zstd:3 | 30.4 | 34.8 | 24.5 | 0.84 | 1.83 |
+| p4_Velocity_aver | 1e-4 | 412 | raw|zstd:3/raw|zstd:3 | 42.0 | 49.1 | 9.8 | 1.66 | 2.17 |
+| p5_Pressure_aver | 1e-4 | 1392 | raw|zstd:3/raw|zstd:3 | 41.0 | 46.1 | 33.9 | 1.05 | 3.99 |
+
+Compared with the CPU gate (12.5x to 22.6x), the GPU gate is 11.7x to 25x in ratio, the same picture: the
+differences come from the tuner's per-field choices (it picked `raw|zstd:3` or `huffman|zstd:3` on these
+repetition-heavy fields, never `xhuff|zstd:3`, which is why the auto default does not hurt the ratio). In
+time, hpMGARD including its tuning pass (about 0.47 s of each run) is 2x to 5x faster than MGARD-X HIP on the
+same GPU; with a fixed configuration (`p4_Pressure_inhouse_*`: 0.16 to 0.18 s) it is about 10x faster.
+hpMGARD GPU decode takes 0.1 to 0.7 s depending on the chosen base split. Caveat as before: step-0 data.

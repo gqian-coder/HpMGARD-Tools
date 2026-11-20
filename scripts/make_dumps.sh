@@ -4,7 +4,7 @@ source /usr/share/lmod/lmod/init/bash 2>/dev/null; module unload cray-libsci dar
 T=/lustre/orion/cfd164/proj-shared/gongq/HODG/tools/dumpbp
 D=/lustre/orion/cfd164/proj-shared/gongq/HODG/results/dumps
 P4=/lustre/orion/proj-shared/cfd164/vki_hodg/ho_dg_p4_sol/sol_1_aver.bp
-P5=/lustre/orion/proj-shared/cfd164/vki_hodg/ho_dg_p5_sol/sol_1_aver.bp
+P5=/lustre/orion/proj-shared/cfd164/vki_hodg/ho_dg_p5_8np_sol/sol_1_aver.bp
 for v in Density_aver Rho_ms P_ms uu vv ww uv vw uw Velocity_aver; do
   [ -f $D/p4_${v}_s0.bin ] || $T $P4 vtkDGHex/$v 0 $D/p4_${v}_s0.bin > /dev/null 2>&1 || echo "FAILED $v"
 done
