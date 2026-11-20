@@ -301,3 +301,50 @@ host boundary (the GPU work is now about 6 ms per field).
 Codec picture on this field: GPU FRBP + zstd is smaller than MGARD-X Huffman + zstd here (304 vs 455 KB) and
 faster (both directions 8 GB/s class); the in-house Huffman + zstd stays the smallest (129 KB) at a quarter of
 the throughput. The GPU tuner list now includes `frbp|zstd:3`; the auto default stays `xhuff|zstd:3`.
+
+## Addendum, 2026-11-20 03:00: block-resident path, no host extraction copy (job 5955222, MI250X frontier00054)
+
+Changes (operator c07a347, tools c10aa3b): the caller's interleaved block is uploaded once per `Compress` call
+through two 32 MB pinned staging buffers on two streams, an OpenMP memcpy into one buffer overlapping the
+link transfer of the other; the statistics and fused kernels read component c with stride ncomp, so the
+265 MB host extraction memcpy of the previous round is gone and a 3-component variable is de-interleaved by
+the kernels. Decompression mirrors it: every component is reconstructed interleaved into one device block and
+downloaded once, chunked and pipelined, straight into the caller's buffer. New `DecompressInto(double* out)`:
+the ADIOS2 operator now reconstructs directly into its destination buffer (before: a temporary vector, a zero
+fill and a second 265 MB copy). The bench times `DecompressInto` into a buffer allocated and touched
+beforehand, as ADIOS2's destination would be, and records the decode breakdown. No tuning, warm-up excluded,
+16 host threads, decode on the GPU unless noted. CSV: `documents/gpu/mi250x_resident_2026-11-20.csv`.
+
+| case | bytes | compress s (prev) | GB/s | decompress s (prev) | GB/s |
+|---|---|---|---|---|---|
+| p4 pressure 1e-3, frbp\|zstd:3 | 304,247 | 0.027 (0.035) | 9.8 | 0.020 (0.034) | 13.2 |
+| p4 pressure 1e-3, frbp (no zstd) | 6,572,219 | 0.025 (0.032) | 10.6 | 0.019 (0.032) | 13.9 |
+| p4 pressure 1e-3, xhuff\|zstd:3 | 455,262 | 0.043 (0.047) | 6.2 | 0.051 (0.065) | 5.2 |
+| p4 pressure 1e-3, huffman\|zstd:3 (host coder) | 129,189 | 0.136 (0.131) | 2.0 | 0.238 (0.224) | 1.1 |
+| p4 pressure 1e-3, CPU, huffman\|zstd:3 | 129,189 | 0.274 (0.355) | 1.0 | 0.291 (0.394) | 0.9 |
+| p4 pressure 1e-3, frbp\|zstd:3, decode on CPU | 304,247 | 0.032 (0.035) | 8.3 | 0.057 (0.183) | 4.6 |
+| p4 pressure 1e-2 / 1e-4, frbp\|zstd:3 | 67,698 / 884,329 | 0.025 / 0.039 | 10.6 / 6.8 | 0.019 / 0.022 | 13.9 / 12.0 |
+| p4 pressure 1e-3, dedup base, frbp\|zstd:3 | 453,843 | 0.040 (0.048) | 6.6 | 0.031 (0.045) | 8.5 |
+| p4 velocity (794 MB, 3 comp) 1e-3, frbp\|zstd:3 | 3,072,866 | 0.080 (0.131) | 9.9 | 0.059 (0.390) | 13.5 |
+| p5 pressure (457 MB, 8 blocks) 1e-3, frbp\|zstd:3 | 193,412 | 0.045 (0.056) | 10.2 | 0.031 (0.056) | 14.8 |
+| p4 pressure 1e-3, tuned (list incl. frbp) | 218,949 (raw\|zstd:3) | 0.459 (0.45 tuning) | | 0.099 | |
+
+Where the time goes now (pressure 1e-3, frbp|zstd:3, 0.027 s compress / 0.020 s decompress): upload 16 to
+17 ms (265 MB, about 16 GB/s through the staging pipeline), statistics 0.3 ms, fused kernel 3 ms, FRBP 3 ms,
+residual zstd 3 ms and the header; decompression is 3 ms of stream decoding and kernels plus 17 to 18 ms of
+download (15 GB/s). The staging memcpy thread count does not matter (8, 16 and 32 threads give the same 16 to
+17 ms; 56 threads is slightly slower because the zstd workers then compete), so the pipeline runs at the
+link rate it achieves and the two link copies are the whole host cost: 60 percent of the compression time
+and 85 percent of the decompression time. The device-side work stays at about 6 to 7 ms per 265 MB field
+(about 40 GB/s). Compared with the previous round the host-to-host throughput rose 1.3x on compression and
+1.6x on decompression for scalars; the velocity decompression rose 6.6x because the previous version
+reconstructed the components one by one into a host vector, zero-filled it and copied it again. CPU-only
+compression and decompression also gained 20 to 25 percent from the parallel scalar copies and the
+in-place output, and GPU-compress / CPU-decompress fell from 0.183 to 0.057 s.
+
+What remains is the link. If ADIOS2 hands the operator device buffers, both copies vanish and the field
+runs at the device rate (about 40 GB/s, the lower end of the mp-MDR paper's range). With host buffers the
+floor is one upload plus one download; the only further overlap available is to reconstruct and download
+cell ranges in a pipeline on decompression (hides the 3 ms of kernels under the download) and, for
+multi-component variables, to run the fused kernel of component c under the upload of component c+1, which
+needs the upload to be split per component rather than per block. Both are second-order (10 to 15 percent).
