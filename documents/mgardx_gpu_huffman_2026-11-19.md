@@ -2,6 +2,59 @@
 
 Written for: hpMGARD developers deciding how the quantised symbol streams should be entropy coded on GPUs.
 
+## Current state (2026-11-20 10:50)
+
+This memo is a dated log. The sections after this one are kept as written, with bracketed notes where a later
+round replaced a statement; where anything below disagrees with this section, this section is current.
+
+Defaults (operator 1eb2d10):
+- `auto` codec: `xhuff|zstd:3` on a GPU where MGARD-X passes its preflight, `huffman|zstd:3` otherwise. The GPU
+  default stays on MGARD-X's coder because that coder is built and tested across devices; the final choice
+  waits for developed-flow data.
+- Tuner lists: GPU `xhuff|zstd:3,frbp|zstd:3,huffman|zstd:3,raw|zstd:3`, CPU `huffman|zstd:3,raw|zstd:3,frbp|zstd:3`.
+  The ADIOS2 plugin tunes once per variable by default (`tuning=once`, also `auto`; `always` and `fixed` are
+  the alternatives).
+- MGARD-X stages: dictionary chosen per stream between 256 and 8192 entries, up to 1% out-of-dictionary codes
+  stored as MGARD-X outliers, Huffman block 4096, decode-and-compare check opt-in (`HPMGARD_XHUFF_VERIFY=1`).
+- zstd: multithreaded from 16 MB inputs (`HPMGARD_ZSTD_MT_MIN_MB`), up to 8 workers.
+
+GPU path: per-component statistics on the device; one fused kernel per cell batch for restriction, base split,
+quantisation, decoded base, prolongation and residual; FRBP and MGARD-X stages on device-resident symbols, with
+zstd on host threads overlapping the later streams; the caller's interleaved block uploaded once per call
+through pinned staging and the result downloaded once into the caller's buffer (`DecompressInto`, used by the
+ADIOS2 operator). Every run meets the bound; GPU FRBP streams are byte-identical to the CPU ones; the CPU and
+HIP test suites pass.
+
+Latest numbers (MI250X, job 5955222, p4 pressure step 0, REL_L2 1e-3, no tuning, warm-up excluded, decode on
+the same device):
+
+| chain | bytes | compress s | GB/s | decompress s | GB/s |
+|---|---|---|---|---|---|
+| frbp\|zstd:3 on the GPU, median of 4 runs | 304,247 | 0.029 | 9.1 | 0.0205 | 12.9 |
+| xhuff\|zstd:3 on the GPU (auto default) | 455,262 | 0.043 | 6.2 | 0.051 | 5.2 |
+| huffman\|zstd:3, in-house coder on the host, rest on the GPU | 129,189 | 0.136 | 1.9 | 0.238 | 1.1 |
+| huffman\|zstd:3, CPU only | 129,189 | 0.274 | 0.97 | 0.291 | 0.91 |
+
+The 3-component velocity (794 MB) and the 8-block p5 pressure (457 MB) compress at 9.8 and 10.2 GB/s with
+`frbp|zstd:3` (03:00 addendum). Where the time goes: the two link copies are about 60 percent of a GPU
+compression and 85 percent of a decompression; the device work is about 6 to 7 ms per 265 MB field (about
+40 GB/s); the host zstd of the last residual stream adds from under 1 ms to about 10 ms depending on the tolerance.
+
+Ratio against MGARD-X (gate v2, geometric mean over six non-constant fields, 1e-2 / 1e-3 / 1e-4):
+`xhuff|zstd:3` is 7.1x / 4.2x / 6.6x smaller than MGARD-X s=inf and the in-house chain 20.8x / 12.1x / 15.9x.
+`frbp|zstd:3` has not been through the gate; on the pressure field it is 2.4x larger than the in-house chain
+and 1.5x smaller than `xhuff|zstd:3`.
+
+Caveats: all data is step 0, whose exact layer repetition favours zstd after a continuous bitstream; MGARD-X's
+HIP Huffman encoder is broken on the login03 MI210 and the preflight falls back there; the CUDA build is
+mapped but not compiled (no nvcc on Frontier); most timing rows are single runs.
+
+Open items: developed-flow data for the GPU default; `frbp|zstd:3` across the gate fields; a repeat-run job for
+medians; reconstruct-and-download per cell range on decompression; per-component upload so the fused kernel of
+one component overlaps the upload of the next; multithreaded zstd for FRBP streams under 16 MB; one-pass
+statistics for multi-component variables; folding the statistics into the fused kernel in ABS mode; the CUDA
+build on an NVIDIA machine.
+
 ## What was built
 
 A new first-stage codec `xhuff[:L]` (StageId 4) in `CompressHpMGARDOperator/src/hpmgard/codec/MgardXHuff*`
@@ -12,10 +65,10 @@ wraps `mgard_x::ComposedLosslessCompressor<int32_t, uint64_t, SERIAL|HIP>`:
 - The stage runs on the backend device of the compressor (`device=cpu|hip`). The bitstream is device independent:
   GPU-coded streams decode on the CPU and vice versa (verified byte-identical on MI250X, 55969 B test stream and the
   464701 B pressure field).
-- Robustness: zigzag codes >= dictionary (8192, `HPMGARD_XHUFF_DICT`), streams < 65536 symbols, an MGARD-X exception,
-  a HIP error, or a failed decode-and-compare after the device encode (`HPMGARD_XHUFF_VERIFY=1`, default) all fall
+- Robustness: zigzag codes >= dictionary (8192, `HPMGARD_XHUFF_DICT`) [now up to 1% kept as MGARD-X outliers, see 01:10], streams < 65536 symbols, an MGARD-X exception,
+  a HIP error, or a failed decode-and-compare after the device encode (`HPMGARD_XHUFF_VERIFY=1`, default) [now opt-in, see 12:05] all fall
   back to the in-house canonical Huffman; a mode byte records which coder wrote the stream. Dictionary and block size
-  (`HPMGARD_XHUFF_BLOCK`, default 20480) are stored in the payload.
+  (`HPMGARD_XHUFF_BLOCK`, default 20480) [now 4096, see 01:10] are stored in the payload.
 - `mgardx::DeviceWorks(device)` preflights MGARD-X itself (compress + decompress of a small array, cached per process);
   the compressor and the tuner skip MGARD-X candidates on a device where it fails instead of aborting.
 - Build gotchas (documented in the code): the SERIAL instantiation lives in its own OpenMP-free static target
@@ -50,7 +103,8 @@ array, the MGARD-X workspace allocation, and (for the verify runs) a GPU decode 
 1. On this data MGARD-X's Huffman does not beat the in-house `huffman|zstd:3`: 3.6x larger with zstd inside
    MGARD-X and 64x larger without it, and no faster even on the GPU. The 20480-symbol block packing of MGARD-X's
    Huffman destroys the repetition of the 32 identical z-layers that zstd exploits after our continuous bitstream
-   (`raw|zstd:19` reaches 65 KB on this field for the same reason). The default codec stays `huffman|zstd:3`.
+   (`raw|zstd:19` reaches 65 KB on this field for the same reason). The default codec stays `huffman|zstd:3`. [On the GPU the default became
+   `xhuff|zstd:3` at 13:00; see Current state.]
 2. MGARD-X's GPU Huffman is correct on MI250X compute nodes and produces exactly the SERIAL bitstream. On the
    login node login03 (MI210, ROCm 7.2.0) the encoder is broken: histogram and sort are right, but the canonical
    codeword generation (GenerateCW) collapses all symbols into one length group (`first[l>1]` = max,
@@ -63,6 +117,8 @@ array, the MGARD-X workspace allocation, and (for the verify runs) a GPU decode 
 3. The code stage is now the largest part of the GPU compress time (0.11 s of 0.32 s). A GPU coder that helps
    must remove zero runs before entropy coding (MGARD-X `ZeroRLE_Rans` / `SymbolRans`, or an in-house GPU
    zero-run + Huffman) and take the quantised symbols directly from device memory (no host zigzag, no H2D).
+   [The symbols are coded from device memory since 12:05. The zero-run coders stay options, not defaults,
+   because the step-0 sparsity is not representative of a developed flow.]
 
 Probe programs used for the diagnosis are in `analysis/mgardx_hip_probe/`.
 
@@ -159,24 +215,24 @@ CSV: `documents/gpu/mi250x_gate_hip_2026-11-19.csv`; job script `scripts/gate_hi
 
 | field | tol | hpMGARD CR | chosen codecs | MGARD-X s=inf CR | MGARD-X s=0 CR | ratio (s=inf) | hpMGARD compress s (tuned) | MGARD-X HIP s |
 |---|---|---|---|---|---|---|---|---|
-| p4_Density_aver | 1e-2 | 8118 | huffman|zstd:3/huffman|zstd:3 | 250.6 | 350.0 | 32.4 | 0.66 | 1.65 |
-| p4_Pressure_aver | 1e-2 | 6980 | huffman|zstd:3/huffman|zstd:3 | 242.4 | 324.6 | 28.8 | 0.66 | 1.65 |
-| p4_Rho_ms | 1e-2 | 6469 | huffman|zstd:3/huffman|zstd:3 | 209.9 | 288.1 | 30.8 | 0.66 | 1.65 |
-| p4_P_ms | 1e-2 | 2550 | raw|zstd:3/raw|zstd:3 | 202.3 | 270.4 | 12.6 | 0.59 | 1.65 |
-| p4_Velocity_aver | 1e-2 | 1200 | raw|zstd:3/raw|zstd:3 | 149.9 | 192.6 | 8.0 | 1.73 | 1.91 |
-| p5_Pressure_aver | 1e-2 | 9468 | huffman|zstd:3/huffman|zstd:3 | 506.7 | 673.3 | 18.7 | 0.80 | 3.77 |
-| p4_Density_aver | 1e-3 | 2195 | huffman|zstd:3/huffman|zstd:3 | 136.2 | 167.9 | 16.1 | 0.73 | 1.67 |
-| p4_Pressure_aver | 1e-3 | 1702 | raw|zstd:3/raw|zstd:3 | 130.6 | 159.4 | 13.0 | 0.60 | 1.64 |
-| p4_Rho_ms | 1e-3 | 1531 | raw|zstd:3/raw|zstd:3 | 115.4 | 141.3 | 13.3 | 0.60 | 1.68 |
-| p4_P_ms | 1e-3 | 1285 | raw|zstd:3/raw|zstd:3 | 111.2 | 136.2 | 11.6 | 0.61 | 1.66 |
-| p4_Velocity_aver | 1e-3 | 591 | raw|zstd:3/raw|zstd:3 | 77.9 | 96.7 | 7.6 | 1.71 | 2.02 |
-| p5_Pressure_aver | 1e-3 | 2842 | huffman|zstd:3/huffman|zstd:3 | 277.0 | 328.0 | 10.3 | 0.83 | 3.79 |
-| p4_Density_aver | 1e-4 | 1045 | raw|zstd:3/raw|zstd:3 | 34.0 | 37.4 | 30.8 | 0.83 | 1.81 |
-| p4_Pressure_aver | 1e-4 | 1024 | raw|zstd:3/raw|zstd:3 | 33.8 | 36.7 | 30.3 | 0.84 | 1.80 |
-| p4_Rho_ms | 1e-4 | 946 | raw|zstd:3/raw|zstd:3 | 30.3 | 34.9 | 31.2 | 0.82 | 1.82 |
-| p4_P_ms | 1e-4 | 745 | raw|zstd:3/raw|zstd:3 | 30.4 | 34.8 | 24.5 | 0.84 | 1.83 |
-| p4_Velocity_aver | 1e-4 | 412 | raw|zstd:3/raw|zstd:3 | 42.0 | 49.1 | 9.8 | 1.66 | 2.17 |
-| p5_Pressure_aver | 1e-4 | 1392 | raw|zstd:3/raw|zstd:3 | 41.0 | 46.1 | 33.9 | 1.05 | 3.99 |
+| p4_Density_aver | 1e-2 | 8118 | huffman\|zstd:3/huffman\|zstd:3 | 250.6 | 350.0 | 32.4 | 0.66 | 1.65 |
+| p4_Pressure_aver | 1e-2 | 6980 | huffman\|zstd:3/huffman\|zstd:3 | 242.4 | 324.6 | 28.8 | 0.66 | 1.65 |
+| p4_Rho_ms | 1e-2 | 6469 | huffman\|zstd:3/huffman\|zstd:3 | 209.9 | 288.1 | 30.8 | 0.66 | 1.65 |
+| p4_P_ms | 1e-2 | 2550 | raw\|zstd:3/raw\|zstd:3 | 202.3 | 270.4 | 12.6 | 0.59 | 1.65 |
+| p4_Velocity_aver | 1e-2 | 1200 | raw\|zstd:3/raw\|zstd:3 | 149.9 | 192.6 | 8.0 | 1.73 | 1.91 |
+| p5_Pressure_aver | 1e-2 | 9468 | huffman\|zstd:3/huffman\|zstd:3 | 506.7 | 673.3 | 18.7 | 0.80 | 3.77 |
+| p4_Density_aver | 1e-3 | 2195 | huffman\|zstd:3/huffman\|zstd:3 | 136.2 | 167.9 | 16.1 | 0.73 | 1.67 |
+| p4_Pressure_aver | 1e-3 | 1702 | raw\|zstd:3/raw\|zstd:3 | 130.6 | 159.4 | 13.0 | 0.60 | 1.64 |
+| p4_Rho_ms | 1e-3 | 1531 | raw\|zstd:3/raw\|zstd:3 | 115.4 | 141.3 | 13.3 | 0.60 | 1.68 |
+| p4_P_ms | 1e-3 | 1285 | raw\|zstd:3/raw\|zstd:3 | 111.2 | 136.2 | 11.6 | 0.61 | 1.66 |
+| p4_Velocity_aver | 1e-3 | 591 | raw\|zstd:3/raw\|zstd:3 | 77.9 | 96.7 | 7.6 | 1.71 | 2.02 |
+| p5_Pressure_aver | 1e-3 | 2842 | huffman\|zstd:3/huffman\|zstd:3 | 277.0 | 328.0 | 10.3 | 0.83 | 3.79 |
+| p4_Density_aver | 1e-4 | 1045 | raw\|zstd:3/raw\|zstd:3 | 34.0 | 37.4 | 30.8 | 0.83 | 1.81 |
+| p4_Pressure_aver | 1e-4 | 1024 | raw\|zstd:3/raw\|zstd:3 | 33.8 | 36.7 | 30.3 | 0.84 | 1.80 |
+| p4_Rho_ms | 1e-4 | 946 | raw\|zstd:3/raw\|zstd:3 | 30.3 | 34.9 | 31.2 | 0.82 | 1.82 |
+| p4_P_ms | 1e-4 | 745 | raw\|zstd:3/raw\|zstd:3 | 30.4 | 34.8 | 24.5 | 0.84 | 1.83 |
+| p4_Velocity_aver | 1e-4 | 412 | raw\|zstd:3/raw\|zstd:3 | 42.0 | 49.1 | 9.8 | 1.66 | 2.17 |
+| p5_Pressure_aver | 1e-4 | 1392 | raw\|zstd:3/raw\|zstd:3 | 41.0 | 46.1 | 33.9 | 1.05 | 3.99 |
 
 Compared with the CPU gate (12.5x to 22.6x), the GPU gate is 11.7x to 25x in ratio, the same picture: the
 differences come from the tuner's per-field choices (it picked `raw|zstd:3` or `huffman|zstd:3` on these
@@ -212,8 +268,10 @@ Reading:
 - Ratio: on this field set `xhuff|zstd:3` is 2.8 to 3.5x larger than the in-house chain (the layer-repetition
   effect) but still 4.2x to 7.1x smaller than MGARD-X s=inf. The velocity rows at 1e-3 and 1e-4 fell back to
   the in-house Huffman for one component because its alphabet exceeded the 8192-entry dictionary cap
-  (compress 0.54 s instead of about 0.25 s); the cap is now 65536 so the GPU path stays on the device. On the
-  CPU build that component codes to 1.20 MB with MGARD-X Huffman versus 0.43 MB with the in-house coder.
+  (compress 0.54 s instead of about 0.25 s); the cap is now 65536 so the GPU path stays on the device.
+  [At 01:10 the cap went back to 8192 with outliers, which keeps velocity on the device without the slow
+  65536-entry codebook.] On the CPU build that component codes to 1.20 MB with MGARD-X Huffman versus 0.43 MB
+  with the in-house coder.
 - L2 comparison: MGARD-X s=0 at the same nominal tolerance reaches an RMSE close to hpMGARD's (pressure 1e-3:
   24.6 vs 24.5; velocity 0.0299 vs 0.0322; density 0.000178 vs 0.000308) while exceeding the pointwise bound
   by 1.45 to 1.72x; its CR is only 1.1 to 1.4x above s=inf. At that roughly equal RMS error hpMGARD's CR is
@@ -293,7 +351,7 @@ warm-up excluded, 16 host threads, decode on the GPU unless noted. CSV: `documen
 
 Breakdown of the 0.035 s (pressure 1e-3, frbp|zstd:3): statistics 0.2 ms, fused kernel 3 ms, FRBP + stream copy
 3 ms, and about 28 ms of host-side data movement: the 265 MB memcpy that extracts the component into pinned
-memory (about 10 ms), the upload (6 to 8 ms), the zstd of the residual stream (about 8 ms, overlapped only
+memory (about 10 ms) [removed at 03:00], the upload (6 to 8 ms), the zstd of the residual stream (about 8 ms, overlapped only
 with later streams) and the header. Compared with the morning's 0.318 s this is 9x; the paper's 100 GB/s is
 device-to-device with fixed-rate coding and no host stages, so the remaining factor is almost entirely the
 host boundary (the GPU work is now about 6 ms per field).
@@ -304,6 +362,11 @@ the throughput. The GPU tuner list now includes `frbp|zstd:3`; the auto default 
 
 ## Addendum, 2026-11-20 03:00: block-resident path, no host extraction copy (job 5955222, MI250X frontier00054)
 
+Corrected 2026-11-20 10:50: the first version of this addendum quoted the fastest of four pressure runs
+(0.027 s, 9.8 GB/s) as the result and a 1.3x compression gain. The table now gives the median and the range
+where the job repeated a case and marks every other row as a single run; the previous round's figures, quoted
+for comparison, were single runs as well.
+
 Changes (operator c07a347, tools c10aa3b): the caller's interleaved block is uploaded once per `Compress` call
 through two 32 MB pinned staging buffers on two streams, an OpenMP memcpy into one buffer overlapping the
 link transfer of the other; the statistics and fused kernels read component c with stride ncomp, so the
@@ -313,38 +376,101 @@ downloaded once, chunked and pipelined, straight into the caller's buffer. New `
 the ADIOS2 operator now reconstructs directly into its destination buffer (before: a temporary vector, a zero
 fill and a second 265 MB copy). The bench times `DecompressInto` into a buffer allocated and touched
 beforehand, as ADIOS2's destination would be, and records the decode breakdown. No tuning, warm-up excluded,
-16 host threads, decode on the GPU unless noted. CSV: `documents/gpu/mi250x_resident_2026-11-20.csv`.
+decode on the GPU unless noted. The job ran two cases four times, at 16, 8, 32 and 56 host threads (the
+thread sweep); every other row ran once at 16 threads. CSV: `documents/gpu/mi250x_resident_2026-11-20.csv`.
 
-| case | bytes | compress s (prev) | GB/s | decompress s (prev) | GB/s |
-|---|---|---|---|---|---|
-| p4 pressure 1e-3, frbp\|zstd:3 | 304,247 | 0.027 (0.035) | 9.8 | 0.020 (0.034) | 13.2 |
-| p4 pressure 1e-3, frbp (no zstd) | 6,572,219 | 0.025 (0.032) | 10.6 | 0.019 (0.032) | 13.9 |
-| p4 pressure 1e-3, xhuff\|zstd:3 | 455,262 | 0.043 (0.047) | 6.2 | 0.051 (0.065) | 5.2 |
-| p4 pressure 1e-3, huffman\|zstd:3 (host coder) | 129,189 | 0.136 (0.131) | 2.0 | 0.238 (0.224) | 1.1 |
-| p4 pressure 1e-3, CPU, huffman\|zstd:3 | 129,189 | 0.274 (0.355) | 1.0 | 0.291 (0.394) | 0.9 |
-| p4 pressure 1e-3, frbp\|zstd:3, decode on CPU | 304,247 | 0.032 (0.035) | 8.3 | 0.057 (0.183) | 4.6 |
-| p4 pressure 1e-2 / 1e-4, frbp\|zstd:3 | 67,698 / 884,329 | 0.025 / 0.039 | 10.6 / 6.8 | 0.019 / 0.022 | 13.9 / 12.0 |
-| p4 pressure 1e-3, dedup base, frbp\|zstd:3 | 453,843 | 0.040 (0.048) | 6.6 | 0.031 (0.045) | 8.5 |
-| p4 velocity (794 MB, 3 comp) 1e-3, frbp\|zstd:3 | 3,072,866 | 0.080 (0.131) | 9.9 | 0.059 (0.390) | 13.5 |
-| p5 pressure (457 MB, 8 blocks) 1e-3, frbp\|zstd:3 | 193,412 | 0.045 (0.056) | 10.2 | 0.031 (0.056) | 14.8 |
-| p4 pressure 1e-3, tuned (list incl. frbp) | 218,949 (raw\|zstd:3) | 0.459 (0.45 tuning) | | 0.099 | |
+| case | runs | bytes | compress s | GB/s | decompress s | GB/s | previous round, compress / decompress s |
+|---|---|---|---|---|---|---|---|
+| p4 pressure 1e-3, frbp\|zstd:3 | 4 | 304,247 | 0.029 median (0.027 to 0.039) | 9.1 | 0.0205 median (0.020 to 0.022) | 12.9 | 0.035 / 0.034 |
+| p4 pressure 1e-3, frbp (no zstd) | 1 | 6,572,219 | 0.025 | 10.6 | 0.019 | 13.9 | 0.032 / 0.032 |
+| p4 pressure 1e-3, xhuff\|zstd:3 | 1 | 455,262 | 0.043 | 6.2 | 0.051 | 5.2 | 0.047 / 0.065 |
+| p4 pressure 1e-3, huffman\|zstd:3 (host coder) | 1 | 129,189 | 0.136 | 1.9 | 0.238 | 1.1 | 0.131 / 0.224 |
+| p4 pressure 1e-3, CPU, huffman\|zstd:3 | 1 | 129,189 | 0.274 | 0.97 | 0.291 | 0.91 | 0.355 / 0.394 |
+| p4 pressure 1e-3, frbp\|zstd:3, decode on CPU | 1 | 304,247 | 0.032 | 8.3 | 0.057 | 4.6 | 0.035 / 0.183 |
+| p4 pressure 1e-2, frbp\|zstd:3 | 1 | 67,698 | 0.025 | 10.6 | 0.019 | 13.9 | 0.031 / 0.032 |
+| p4 pressure 1e-4, frbp\|zstd:3 | 1 | 884,329 | 0.039 | 6.8 | 0.022 | 12.0 | 0.042 / 0.035 |
+| p4 pressure 1e-3, dedup base, frbp\|zstd:3 | 1 | 453,843 | 0.040 | 6.6 | 0.031 | 8.5 | 0.048 / 0.045 |
+| p4 velocity (794 MB, 3 comp) 1e-3, frbp\|zstd:3 | 4 | 3,072,866 | 0.081 median (0.079 to 0.104) | 9.8 | 0.0595 median (0.059 to 0.061) | 13.3 | 0.131 / 0.390 |
+| p5 pressure (457 MB, 8 blocks) 1e-3, frbp\|zstd:3 | 1 | 193,412 | 0.045 | 10.2 | 0.031 | 14.8 | 0.056 / 0.056 |
+| p4 pressure 1e-3, tuned (list incl. frbp) | 1 | 218,949 (raw\|zstd:3) | 0.459 (0.45 tuning) | | 0.099 | | 0.494 / 0.216 |
 
-Where the time goes now (pressure 1e-3, frbp|zstd:3, 0.027 s compress / 0.020 s decompress): upload 16 to
-17 ms (265 MB, about 16 GB/s through the staging pipeline), statistics 0.3 ms, fused kernel 3 ms, FRBP 3 ms,
-residual zstd 3 ms and the header; decompression is 3 ms of stream decoding and kernels plus 17 to 18 ms of
-download (15 GB/s). The staging memcpy thread count does not matter (8, 16 and 32 threads give the same 16 to
-17 ms; 56 threads is slightly slower because the zstd workers then compete), so the pipeline runs at the
-link rate it achieves and the two link copies are the whole host cost: 60 percent of the compression time
-and 85 percent of the decompression time. The device-side work stays at about 6 to 7 ms per 265 MB field
-(about 40 GB/s). Compared with the previous round the host-to-host throughput rose 1.3x on compression and
-1.6x on decompression for scalars; the velocity decompression rose 6.6x because the previous version
-reconstructed the components one by one into a host vector, zero-filled it and copied it again. CPU-only
-compression and decompression also gained 20 to 25 percent from the parallel scalar copies and the
-in-place output, and GPU-compress / CPU-decompress fell from 0.183 to 0.057 s.
+Where the time goes (pressure 1e-3, frbp|zstd:3, median 0.029 s compress and 0.0205 s decompress):
+- Upload of the 265 MB block: 16 to 17 ms in three of the four runs and 26 ms in the slowest, which is the
+  whole spread of the compress time. Across the job the single-component uploads took 15 to 17 ms, except that
+  run and the three runs that decode on the CPU (19 to 22 ms): about 16 GB/s through the staging pipeline.
+- Device work: statistics 0.3 ms, fused kernel 3.3 ms, FRBP 3 ms.
+- Host zstd of the residual stream. For a scalar it is the last stream, so nothing overlaps it. Estimated as
+  the compress time minus the timed stages, less the same remainder of the frbp-only run: under 1 ms at 1e-2,
+  3 to 4.5 ms at 1e-3, and about 10 ms at 1e-4, where the FRBP stream is 9.9 MB and so below the 16 MB
+  multithreading threshold.
+- Decompression: 2.6 ms of stream decoding and kernels plus 17 to 19 ms of download (about 15 GB/s).
 
-What remains is the link. If ADIOS2 hands the operator device buffers, both copies vanish and the field
-runs at the device rate (about 40 GB/s, the lower end of the mp-MDR paper's range). With host buffers the
-floor is one upload plus one download; the only further overlap available is to reconstruct and download
-cell ranges in a pipeline on decompression (hides the 3 ms of kernels under the download) and, for
-multi-component variables, to run the fused kernel of component c under the upload of component c+1, which
-needs the upload to be split per component rather than per block. Both are second-order (10 to 15 percent).
+The staging memcpy thread count does not change the upload: the 8- and 32-thread runs and the other 16-thread
+runs of the job all upload in 15 to 17 ms. At 56 threads the compression is slower overall (velocity code
+stage 30 ms instead of 10 ms), likely because the 56 OpenMP threads then compete with the zstd worker threads
+for the 56 cores. The two link copies are about 60 percent of the compression time and 85 percent of the
+decompression time at 1e-3; the device-side work is about 6 to 7 ms per 265 MB field (about 40 GB/s).
+
+Gains against the previous round (medians where repeated, single runs otherwise):
+
+| case | compress | decompress |
+|---|---|---|
+| p4 pressure, frbp\|zstd:3 | 1.2x (0.035 to 0.029 s) | 1.6x (0.034 to 0.0205 s; 1.5 to 1.7x over the four runs) |
+| p4 velocity, frbp\|zstd:3 | 1.6x (0.131 to 0.081 s) | 6.6x (0.390 to 0.0595 s) |
+| p5 pressure, frbp\|zstd:3 | 1.2x (0.056 to 0.045 s) | 1.8x (0.056 to 0.031 s) |
+| p4 pressure, CPU only | 1.3x (0.355 to 0.274 s) | 1.35x (0.394 to 0.291 s) |
+| p4 pressure, GPU compress and CPU decode | 1.1x (0.035 to 0.032 s) | 3.2x (0.183 to 0.057 s) |
+
+The velocity decompression gains most because the previous version reconstructed the components one by one
+into a host vector, zero-filled it and copied it again. The CPU-only gains come from the parallel scalar
+copies and the in-place output.
+
+What remains is the link, plus the residual zstd at tight tolerances. If ADIOS2 hands the operator device
+buffers, both copies vanish and the field runs at the device rate (about 40 GB/s, the lower end of the mp-MDR
+paper's range). With host buffers the floor is one upload plus one download; the further overlaps available
+are to reconstruct and download cell ranges in a pipeline on decompression (hides the 3 ms of kernels under
+the download) and, for multi-component variables, to run the fused kernel of component c under the upload of
+component c+1, which needs the upload to be split per component rather than per block. Both are second-order
+(10 to 15 percent). Multithreaded zstd for the 10 MB FRBP stream at 1e-4 is untested; on the 8 MB Huffman
+streams it gave no gain and cost 1.4% in size.
+
+## Addendum, 2026-11-20 10:50: who computes the statistics, and the CUDA shim
+
+Statistics inside the operator. For every component of every block the compressor computes the minimum, the
+maximum and the sum of squares in one pass: on the GPU with a reduction kernel over the resident block,
+reading component c with stride ncomp; on the CPU with an OpenMP reduction. They serve two purposes:
+- the scale that turns a relative tolerance into an absolute bound: the RMS for REL_L2, which is the
+  operator's default mode, and the range for REL_RANGE;
+- constant detection in every mode: a component whose minimum equals its maximum is stored as one 8-byte value
+  and skips the pipeline. The six Reynolds-stress fields of the p4 file take this path at step 0.
+
+NaN and Inf do not depend on the statistics: the quantiser's overflow flag catches both in every mode, and the
+component is then stored raw.
+
+The converter's pre-pass. `hpmgard_adios_compress` first reads every block of a variable at a step, computes one
+scale per component over all blocks, and passes absolute per-component tolerances with mode ABS, so every block
+of the variable gets the same absolute bound. The operator cannot do this itself: ADIOS2 calls it once per
+block with that block's data and no communicator, so inside the operator a relative tolerance can only be
+relative to the block. An application that wants one bound per variable has to reduce the scale over its ranks
+before Put and pass ABS tolerances, as the converter does. In the converter's case the operator's sum of
+squares goes unused; its minimum and maximum still drive the constant check. The pre-pass costs a second full
+read of every compressed variable per step from the file (not measured); `--block-norm` and `--mode ABS` skip it.
+
+Cost of the operator's statistics (job 5955222, 1e-3):
+
+| field | chain | statistics | whole compress |
+|---|---|---|---|
+| p4 pressure, GPU | frbp\|zstd:3 | 0.3 ms | 0.029 s (median) |
+| p5 pressure, GPU | frbp\|zstd:3 | 0.4 ms | 0.045 s |
+| p4 velocity, GPU | frbp\|zstd:3 | 2.0 ms | 0.081 s (median) |
+| p4 pressure, CPU | huffman\|zstd:3 | 2.7 ms | 0.274 s |
+
+The velocity pays more because each of its three component passes reads the whole interleaved block; one pass
+computing all components would cut that to about a third. In ABS mode the separate pass could be folded into
+the fused kernel, which already reads every value and returns a flag, saving the kernel and one synchronous
+readback per component: under 1 percent of a host-to-host call now, a few percent of the device-only time if
+ADIOS2 hands over device buffers. Neither change is made.
+
+CUDA shim. Operator 1eb2d10 maps the stream API used by the pipelined copies (`hipStream_t`, `hipStreamCreate`,
+`hipStreamSynchronize`, `hipMemcpyAsync`) to CUDA. A name-by-name check finds every HIP runtime name used by
+the device sources mapped. The CUDA build is still not compiled, since Frontier has no nvcc.
