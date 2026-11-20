@@ -83,16 +83,18 @@ int main(int argc, char** argv) {
     }
 
     BlockMeta meta; meta.dims = {ncells, static_cast<uint64_t>(nsp) * cfg.ncomp};
+    // the output buffer is allocated and touched before timing, as ADIOS2's destination buffer would be
+    std::vector<double> out(data.size(), 0.0);
     if (a.count("warmup")) {   // untimed round trip: kernel loading, MGARD-X workspaces, pinned scratch of both directions
         CompressResult w = Compress(field, cfg, mesh_ptr, meta);
-        std::vector<double> wo; Decompress(w.bytes.data(), w.bytes.size(), mesh_ptr, wo, nullptr, get("decode-device", cfg.device));
+        DecompressInto(w.bytes.data(), w.bytes.size(), mesh_ptr, out.data(), out.size(), nullptr, get("decode-device", cfg.device));
     }
     const auto t0 = Clock::now();
     CompressResult r = Compress(field, cfg, mesh_ptr, meta);
     const double t_comp = Sec(t0, Clock::now());
     const auto t1 = Clock::now();
-    std::vector<double> out; BlockHeader h;
-    Decompress(r.bytes.data(), r.bytes.size(), mesh_ptr, out, &h, get("decode-device", cfg.device));
+    BlockHeader h; DecompressStats ds;
+    DecompressInto(r.bytes.data(), r.bytes.size(), mesh_ptr, out.data(), out.size(), &h, get("decode-device", cfg.device), &ds);
     const double t_dec = Sec(t1, Clock::now());
     double maxerr = 0, sq = 0; double maxrel = 0;
     for (int v = 0; v < cfg.ncomp; ++v) {
@@ -130,14 +132,14 @@ int main(int argc, char** argv) {
     const std::string label = get("label", a["raw"]);
     const bool header = !a.count("csv") || !std::ifstream(a["csv"]).good();
     FILE* out_f = a.count("csv") ? std::fopen(a["csv"].c_str(), "a") : stdout;
-    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0,device,t_stats,t_refactor,t_base,t_residual,t_code,mgardx_rmse_sinf,mgardx_rmse_s0,t_geom,t_extract,t_upload\n");
+    if (header) std::fprintf(out_f, "label,ncells,p,ncomp,norm,tol,tol_abs0,raw_bytes,hpm_bytes,hpm_CR,hpm_maxerr_over_tol,hpm_rmse,hpm_t_comp_s,hpm_t_dec_s,hpm_t_tune_s,base_order,base_method,base_quantum,base_codec,residual_codec,direct,mgardx_CR_sinf,mgardx_maxerr_over_tol_sinf,mgardx_t_sinf,mgardx_CR_s0,mgardx_maxerr_over_tol_s0,mgardx_t_s0,device,t_stats,t_refactor,t_base,t_residual,t_code,mgardx_rmse_sinf,mgardx_rmse_s0,t_geom,t_extract,t_upload,t_dec_decode,t_dec_download,t_dec_insert\n");
     const CompressConfig& u = r.stats.used;
-    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.6g,%.6g,%.4f,%.4f,%.4f\n",
+    std::fprintf(out_f, "%s,%zu,%d,%d,%s,%g,%g,%llu,%llu,%.3f,%.4f,%.6g,%.3f,%.3f,%.3f,%d,%s,%g,%s,%s,%d,%.3f,%.4f,%.3f,%.3f,%.4f,%.3f,%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.6g,%.6g,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
                  label.c_str(), ncells, cfg.p, cfg.ncomp, norm.c_str(), cfg.tolerance, h.tol_abs[0],
                  (unsigned long long)r.stats.raw_bytes, (unsigned long long)r.stats.compressed_bytes, r.stats.ratio(), maxrel, rmse, t_comp, t_dec, r.stats.t_tune,
                  u.base_order, u.base_method == BaseMethod::DedupSfc ? "dedup" : u.base_method == BaseMethod::CellAvg ? "cellavg" : "plain", u.base_quantum_ratio,
                  u.base_codec.c_str(), u.residual_codec.c_str(), u.direct_mgardx ? 1 : 0, cr_mx_inf, err_mx_inf, t_mx_inf, cr_mx_0, err_mx_0, t_mx_0,
-                 h.writer.c_str(), r.stats.t_stats, r.stats.t_refactor, r.stats.t_base, r.stats.t_residual, r.stats.t_code, rmse_mx_inf, rmse_mx_0, r.stats.t_geom, r.stats.t_extract, r.stats.t_upload);
+                 h.writer.c_str(), r.stats.t_stats, r.stats.t_refactor, r.stats.t_base, r.stats.t_residual, r.stats.t_code, rmse_mx_inf, rmse_mx_0, r.stats.t_geom, r.stats.t_extract, r.stats.t_upload, ds.t_decode, ds.t_download, ds.t_insert);
     if (out_f != stdout) std::fclose(out_f);
     if (maxrel > 1.0 + 1e-9) { std::cerr << "ERROR: bound violated (max err / tol = " << maxrel << ")\n"; return 4; }
     return 0;
